@@ -761,10 +761,11 @@ impl Decoder {
             // The halves blocked in rowBlock, back to linear, into the lines.
             for (comp, target) in targets.iter().enumerate() {
                 let convert = |v: u16| if linear { to_linear(v) } else { v };
-                for y in 8 * blocky..8 * blocky + max_y {
-                    let row = target.rows[y];
+                let top = 8 * blocky;
+                // (`y` is the line within the row of blocks.)
+                for (y, &row) in target.rows[top..top + max_y].iter().enumerate() {
                     for blockx in 0..num_full_blocks_x {
-                        let src = comp * block_row + blockx * 64 + (y & 7) * 8;
+                        let src = comp * block_row + blockx * 64 + y * 8;
                         for x in 0..8 {
                             let at = row + 2 * (8 * blockx + x);
                             out[at..at + 2]
@@ -772,7 +773,7 @@ impl Decoder {
                         }
                     }
                     if num_full_blocks_x != num_blocks_x {
-                        let src = comp * block_row + num_full_blocks_x * 64 + (y & 7) * 8;
+                        let src = comp * block_row + num_full_blocks_x * 64 + y * 8;
                         for x in 0..max_x {
                             let at = row + 2 * (8 * num_full_blocks_x + x);
                             out[at..at + 2]
