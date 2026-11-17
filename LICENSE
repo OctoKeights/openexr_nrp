@@ -1,8 +1,8 @@
 openexr_nrp is a native Rust port of parts of OpenEXRCore, of OpenEXR v3.5.4, by the
 Contributors to the OpenEXR Project
-(https://github.com/AcademySoftwareFoundation/openexr). It is offered under the original's
-licence, which follows: the original's copyright notices are kept, and the port's own
-work, Copyright 2026 OctoKeights, is offered under the same terms.
+(https://github.com/AcademySoftwareFoundation/openexr). It is distributed under OpenEXR's
+licence, which follows. OpenEXR's copyright notice is retained, and the port's own work,
+Copyright 2026 OctoKeights, is offered under the same terms.
 
 ------------------------------------------------------------------------------
 

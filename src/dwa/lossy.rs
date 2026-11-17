@@ -6,7 +6,8 @@ use super::simd::{
     dct_forward8x8, dct_inverse8x8, dct_inverse8x8_dc_only, float_to_half, from_half_zig_zag,
     half_to_float,
 };
-use super::{CORRUPT_CHUNK, Code, PIXEL_FLOAT, to_linear, to_nonlinear};
+use super::{to_linear, to_nonlinear};
+use crate::{Error, PixelType};
 
 // ---------------------------------------------------------------------------------------
 // Quantization.
@@ -421,12 +422,20 @@ fn rle_ac(block: &[u16; 64], out: &mut Vec<u16>) {
 /// A channel's lines in the block, for the encoder: where each starts, and their type.
 pub(super) struct Source {
     pub rows: Vec<usize>,
-    pub pixel_type: i32,
+    pub pixel_type: PixelType,
+}
+
+/// A block's coefficients as the encoder makes them: the run-length coded AC coefficients of
+/// every 8 by 8 square of every lossy channel, and the DC ones, each channel's together.
+#[derive(Default)]
+pub(super) struct Coefficients {
+    pub ac: Vec<u16>,
+    pub dc: Vec<u16>,
 }
 
 /// `LossyDctEncoder_execute`: one channel, or three (red, green and blue, converted to
-/// Y'CbCr), of `raw` coded, their AC coefficients added to `packed_ac` and their DC ones to
-/// `packed_dc`. `nonlinear` is whether the values go through `toNonlinear` first.
+/// Y'CbCr), of `raw` coded, their coefficients added to `out`. `nonlinear` is whether the
+/// values go through `toNonlinear` first.
 pub(super) fn encode(
     raw: &[u8],
     sources: &[Source],
@@ -434,8 +443,7 @@ pub(super) fn encode(
     nonlinear: bool,
     width: usize,
     height: usize,
-    packed_ac: &mut Vec<u16>,
-    packed_dc: &mut Vec<u16>,
+    out: &mut Coefficients,
 ) {
     let quant_base_error = if quant_base_error < 0.0 {
         0.0
@@ -466,7 +474,7 @@ pub(super) fn encode(
             let mut halves = Vec::with_capacity(width * height);
             for &row in &source.rows {
                 for x in 0..width {
-                    if source.pixel_type == PIXEL_FLOAT {
+                    if source.pixel_type == PixelType::Float {
                         let at = row + 4 * x;
                         // Clamp to half ranges, instead of just casting. (A NaN stays one.)
                         let src = f32::from_bits(u32::from_le_bytes([
@@ -542,12 +550,12 @@ pub(super) fn encode(
                     );
                 }
                 dc[chan].push(half_zig[0]);
-                rle_ac(&half_zig, packed_ac);
+                rle_ac(&half_zig, &mut out.ac);
             }
         }
     }
     for plane in dc {
-        packed_dc.extend_from_slice(&plane);
+        out.dc.extend_from_slice(&plane);
     }
 }
 
@@ -558,7 +566,18 @@ pub(super) struct Target {
     /// The channel's index (three targets may be the same channel).
     pub channel: usize,
     pub rows: Vec<usize>,
-    pub pixel_type: i32,
+    pub pixel_type: PixelType,
+}
+
+/// The coefficients the decoder reads, and where it has reached: the next AC and DC values,
+/// and how many of each the block's counters say are left.
+pub(super) struct Packed<'a> {
+    pub ac: &'a [u16],
+    pub ac_at: usize,
+    pub ac_left: u64,
+    pub dc: &'a [u16],
+    pub dc_at: usize,
+    pub dc_left: u64,
 }
 
 /// `LossyDctDecoder`, with the per-channel blocks (`_dctData`, `_halfZigData`) of every
@@ -566,9 +585,10 @@ pub(super) struct Target {
 pub(super) struct Decoder {
     dct: Vec<[f32; 64]>,
     half_zig: Vec<[u16; 64]>,
-    /// How many AC and DC values the last decode took (`_packedAcCount`, `_packedDcCount`).
-    pub ac_count: usize,
-    pub dc_count: usize,
+    /// How many AC and DC values the current decode has taken (`_packedAcCount`,
+    /// `_packedDcCount`).
+    ac_count: usize,
+    dc_count: usize,
 }
 
 impl Decoder {
@@ -589,19 +609,19 @@ impl Decoder {
         packed_ac: &[u16],
         at: &mut usize,
         end: u64,
-    ) -> Result<usize, Code> {
+    ) -> Result<usize, Error> {
         let mut dct_comp = 1usize;
         let mut ac = *at;
         let mut lnz = 0usize;
         let mut ac_count = 0usize;
         while dct_comp < 64 {
             if ac as u64 >= end {
-                return Err(CORRUPT_CHUNK);
+                return Err(Error::CorruptChunk);
             }
             // (Past the coefficients there are, which takes damaged counters and rules
             // together, the original reads on into whatever follows them.)
             let Some(&val) = packed_ac.get(ac) else {
-                return Err(CORRUPT_CHUNK);
+                return Err(Error::CorruptChunk);
             };
             if (val & 0xff00) == 0xff00 {
                 let count = usize::from(val & 0xff);
@@ -620,26 +640,38 @@ impl Decoder {
     }
 
     /// `LossyDctDecoder_execute`: one or three channels (red, green, blue, from Y'CbCr) into
-    /// `out`, from the AC values `packed_ac[ac_at..]` (`rem_ac` of them left) and the DC
-    /// ones `packed_dc[dc_at..]` (`rem_dc`). `linear` is whether the values go through
-    /// `toLinear`.
-    #[allow(clippy::too_many_arguments)]
+    /// `out`, from the coefficients `packed`, which it moves past those it takes, whether or
+    /// not it succeeds. `linear` is whether the values go through `toLinear`.
     pub(super) fn decode(
         &mut self,
         out: &mut [u8],
         targets: &[Target],
-        packed_ac: &[u16],
-        ac_at: usize,
-        rem_ac: u64,
-        packed_dc: &[u16],
-        dc_at: usize,
-        rem_dc: u64,
+        packed: &mut Packed,
         linear: bool,
         width: usize,
         height: usize,
-    ) -> Result<(), Code> {
+    ) -> Result<(), Error> {
         self.ac_count = 0;
         self.dc_count = 0;
+        let result = self.decode_into(out, targets, packed, linear, width, height);
+        packed.ac_at += self.ac_count;
+        packed.dc_at += self.dc_count;
+        packed.ac_left -= self.ac_count as u64;
+        packed.dc_left -= self.dc_count as u64;
+        result
+    }
+
+    fn decode_into(
+        &mut self,
+        out: &mut [u8],
+        targets: &[Target],
+        packed: &Packed,
+        linear: bool,
+        width: usize,
+        height: usize,
+    ) -> Result<(), Error> {
+        let (packed_ac, ac_at, rem_ac) = (packed.ac, packed.ac_at, packed.ac_left);
+        let (packed_dc, dc_at, rem_dc) = (packed.dc, packed.dc_at, packed.dc_left);
         let num_comp = targets.len();
         let num_blocks_x = width.div_ceil(8);
         let num_blocks_y = height.div_ceil(8);
@@ -648,7 +680,7 @@ impl Decoder {
         let num_full_blocks_x = width / 8;
 
         if rem_dc < (num_comp * num_blocks_x * num_blocks_y) as u64 {
-            return Err(CORRUPT_CHUNK);
+            return Err(Error::CorruptChunk);
         }
 
         let block_row = num_blocks_x * 64;
@@ -753,7 +785,7 @@ impl Decoder {
 
         // The channels of floats, from halves, in place (from the end of each line).
         for target in targets {
-            if target.pixel_type != PIXEL_FLOAT {
+            if target.pixel_type != PixelType::Float {
                 continue;
             }
             for &row in &target.rows[..height] {

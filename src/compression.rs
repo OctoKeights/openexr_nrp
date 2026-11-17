@@ -1,11 +1,12 @@
 //! zlib streams as OpenEXRCore makes and reads them (`compression.c` of OpenEXR v3.5.4), with
 //! the libdeflate it comes with ([`libdeflate_nrp`]).
 
-use crate::{CORRUPT_CHUNK, Code, OUT_OF_MEMORY};
+use crate::Error;
+use libdeflate_nrp::Level;
 
 /// `exr_compress_max_buffer_size`: the room `exr_compress_buffer` is given, which is also
 /// enough for OpenEXRCore's Huffman coder's spare memory.
-pub fn compress_max_buffer_size(in_bytes: usize) -> usize {
+pub(crate) fn compress_max_buffer_size(in_bytes: usize) -> usize {
     let Some(mut r) = libdeflate_nrp::zlib_compress_bound(in_bytes).checked_add(9) else {
         return usize::MAX;
     };
@@ -28,29 +29,25 @@ pub fn compress_max_buffer_size(in_bytes: usize) -> usize {
 }
 
 /// `exr_compress_buffer` with libdeflate's `libdeflate_zlib_compress`: `input` as a zlib
-/// stream at `level` (a negative level is OpenEXR's default, 4; libdeflate's levels 0 and 2
-/// to 9).
-///
-/// # Panics
-///
-/// For level 1 or a level above 9, which [`libdeflate_nrp`] does not port.
-pub fn compress_buffer(level: i32, input: &[u8]) -> Vec<u8> {
-    let level = if level < 0 { 4 } else { level };
-    let level = u8::try_from(level)
-        .ok()
-        .and_then(libdeflate_nrp::Level::new)
-        .unwrap_or_else(|| panic!("libdeflate level {level} is not ported"));
+/// stream at `level`.
+pub(crate) fn compress_buffer(level: Level, input: &[u8]) -> Vec<u8> {
     libdeflate_nrp::zlib_compress(input, level)
 }
 
+/// The level OpenEXRCore compresses at unless a file says otherwise: libdeflate's 4.
+pub(crate) const DEFAULT_LEVEL: Level = match Level::new(4) {
+    Some(level) => level,
+    None => unreachable!(),
+};
+
 /// `exr_uncompress_buffer`: the zlib stream `input` into the start of `out`, the bytes made,
-/// or OpenEXRCore's code for why not: [`CORRUPT_CHUNK`] for a stream that is not one or does
-/// not end where `input` does, [`OUT_OF_MEMORY`] for one that makes more than `out` takes.
-pub fn uncompress_buffer(input: &[u8], out: &mut [u8]) -> Result<usize, Code> {
+/// or why not: [`Error::CorruptChunk`] for a stream that is not one or does not end where
+/// `input` does, [`Error::OutOfMemory`] for one that makes more than `out` takes.
+pub(crate) fn uncompress_buffer(input: &[u8], out: &mut [u8]) -> Result<usize, Error> {
     match libdeflate_nrp::zlib_decompress(input, out) {
         Ok(result) if result.bytes_read == input.len() => Ok(result.bytes_written),
-        Ok(_) | Err(libdeflate_nrp::Error::BadData) => Err(CORRUPT_CHUNK),
-        Err(libdeflate_nrp::Error::InsufficientSpace) => Err(OUT_OF_MEMORY),
+        Ok(_) | Err(libdeflate_nrp::Error::BadData) => Err(Error::CorruptChunk),
+        Err(libdeflate_nrp::Error::InsufficientSpace) => Err(Error::OutOfMemory),
     }
 }
 
@@ -61,20 +58,22 @@ mod tests {
     #[test]
     fn levels_and_refusals() {
         let data = b"OpenEXR, OpenEXR, OpenEXR, and again OpenEXR".repeat(50);
-        // (OpenEXR's default is 4.)
-        assert_eq!(compress_buffer(-1, &data), compress_buffer(4, &data));
-        let stream = compress_buffer(9, &data);
+        let stream = compress_buffer(Level::BEST, &data);
         assert!(stream.len() <= compress_max_buffer_size(data.len()));
+        assert_ne!(compress_buffer(DEFAULT_LEVEL, &data), stream);
         let mut out = vec![0u8; data.len()];
         assert_eq!(uncompress_buffer(&stream, &mut out), Ok(data.len()));
         assert_eq!(out, data);
         assert_eq!(
             uncompress_buffer(&stream, &mut out[..10]),
-            Err(OUT_OF_MEMORY)
+            Err(Error::OutOfMemory)
         );
         let mut longer = stream.clone();
         longer.push(0);
-        assert_eq!(uncompress_buffer(&longer, &mut out), Err(CORRUPT_CHUNK));
+        assert_eq!(
+            uncompress_buffer(&longer, &mut out),
+            Err(Error::CorruptChunk)
+        );
         assert_eq!(compress_max_buffer_size(0), 1_835_036);
         assert_eq!(compress_max_buffer_size(usize::MAX), usize::MAX);
     }

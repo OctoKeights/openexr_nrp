@@ -1,8 +1,8 @@
 //! DWAA and DWAB, DreamWorks Animation's lossy compressions for `.exr` files, a block at a
 //! time: a port of OpenEXRCore's (`internal_dwa*.{c,h}` of OpenEXR v3.5.4). [`compress`]
-//! makes a block of an image's lines into what a file holds, and [`uncompress`] makes it
-//! back, or gives OpenEXRCore's code for why not ([`CORRUPT_CHUNK`] for most of what is
-//! damaged).
+//! compresses a block of an image's lines as a file stores it, and [`decompress`]
+//! decompresses one, or reports the [`Error`] OpenEXRCore gives ([`Error::CorruptChunk`] for
+//! most damage).
 //!
 //! A block is its lines one after the other, each with its channels one after the other (in
 //! the order of their names, as a file has them), as little-endian halves, floats and 32-bit
@@ -18,8 +18,7 @@
 //! and its lookup tables, which it makes with the C library's `powf` and `logf`, are those
 //! glibc makes (`to_linear.bin`, `to_nonlinear.bin`). OpenEXRCore's own blocks differ on
 //! other machines. The ZIP of the blocks is libdeflate's, as OpenEXRCore asks for it
-//! ([`crate::compression`]), and the Huffman coding that of PIZ as OpenEXRCore has it
-//! (`huf.rs`).
+//! ([`libdeflate_nrp`]), and the Huffman coding that of PIZ as OpenEXRCore has it (`huf.rs`).
 //!
 //! Every channel is taken to be sampled at every pixel.
 
@@ -27,70 +26,99 @@ mod huf;
 mod lossy;
 mod simd;
 
-use crate::compression::{compress_buffer, compress_max_buffer_size, uncompress_buffer};
-pub use crate::{
-    ARGUMENT_OUT_OF_RANGE, BAD_CHUNK_LEADER, CORRUPT_CHUNK, Code, INVALID_ARGUMENT, OUT_OF_MEMORY,
+use crate::compression::{
+    DEFAULT_LEVEL, compress_buffer, compress_max_buffer_size, uncompress_buffer,
 };
+use crate::{Error, PixelType};
+use libdeflate_nrp::Level;
 
-const PIXEL_UINT: i32 = 0;
-const PIXEL_HALF: i32 = 1;
-const PIXEL_FLOAT: i32 = 2;
-
-static TO_LINEAR_BYTES: &[u8; 131072] = include_bytes!("to_linear.bin");
-static TO_NONLINEAR_BYTES: &[u8; 131072] = include_bytes!("to_nonlinear.bin");
-
-/// `exrcore_dwaToLinearTable` (or `ToNonLinear`): a half from the table of its bits.
-fn table(bytes: &[u8; 131072], h: u16) -> u16 {
-    let at = 2 * h as usize;
-    u16::from_le_bytes([bytes[at], bytes[at + 1]])
+/// A table of a half for each half, from its little-endian bytes.
+const fn table(bytes: &[u8; 131072]) -> [u16; 65536] {
+    let mut table = [0; 65536];
+    let mut i = 0;
+    while i < 65536 {
+        table[i] = u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]);
+        i += 1;
+    }
+    table
 }
 
+/// `exrcore_dwaToLinearTable` and `exrcore_dwaToNonLinearTable`.
+static TO_LINEAR: [u16; 65536] = table(include_bytes!("to_linear.bin"));
+static TO_NONLINEAR: [u16; 65536] = table(include_bytes!("to_nonlinear.bin"));
+
 fn to_linear(h: u16) -> u16 {
-    table(TO_LINEAR_BYTES, h)
+    TO_LINEAR[usize::from(h)]
 }
 
 fn to_nonlinear(h: u16) -> u16 {
-    table(TO_NONLINEAR_BYTES, h)
+    TO_NONLINEAR[usize::from(h)]
 }
 
 /// A channel of the block.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Channel<'a> {
+    /// The channel's name, which decides how it is compressed.
     pub name: &'a str,
-    /// `PIXELTYPE_*`: 0 unsigned integers, 1 halves, 2 floats.
-    pub pixel_type: i32,
-    /// Whether the channel says its values are linear (`pLinear`): they are then compressed
-    /// as they are, and not by the lookup tables first.
-    pub p_linear: bool,
+    /// The type of its values.
+    pub pixel_type: PixelType,
+    /// Whether the file marks the channel's values as perceptually linear (`pLinear`): a
+    /// lossy channel's values are then compressed as they are, and not converted to a
+    /// perceptual scale first.
+    pub linear: bool,
 }
 
 impl Channel<'_> {
     fn bytes_per_element(&self) -> usize {
-        if self.pixel_type == PIXEL_HALF { 2 } else { 4 }
+        self.pixel_type.bytes()
     }
+}
+
+/// How a block's AC coefficients are compressed, after run-length encoding.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum AcCompression {
+    /// Huffman coding, as PIZ codes (`STATIC_HUFFMAN`): OpenEXR's choice for every block
+    /// but the tiles of DWAA.
+    #[default]
+    Huffman,
+    /// zlib (`DEFLATE`): OpenEXR's choice for the tiles of DWAA.
+    Deflate,
 }
 
 // ---------------------------------------------------------------------------------------
 // The rules for a channel's compression (`internal_dwa_classifier.h`).
 
-const UNKNOWN: u8 = 0;
-const LOSSY_DCT: u8 = 1;
-const RLE: u8 = 2;
-const NUM_COMPRESSOR_SCHEMES: u8 = 3;
+/// How a channel is compressed (`CompressorScheme`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scheme {
+    /// ZIP, as it is: the channels no rule matches.
+    Unknown = 0,
+    LossyDct = 1,
+    Rle = 2,
+}
 
-/// `Classifier`.
+impl Scheme {
+    fn from_code(code: u8) -> Option<Scheme> {
+        [Scheme::Unknown, Scheme::LossyDct, Scheme::Rle]
+            .get(usize::from(code))
+            .copied()
+    }
+}
+
+/// `Classifier`: a suffix of a channel's name, and how such channels are compressed.
 #[derive(Clone, Debug)]
 struct Rule {
     suffix: Vec<u8>,
-    scheme: u8,
-    pixel_type: i32,
-    csc_idx: i32,
+    scheme: Scheme,
+    pixel_type: PixelType,
+    /// Which of red, green and blue such a channel is, for the conversion to Y'CbCr.
+    csc_idx: Option<usize>,
     case_insensitive: bool,
 }
 
 /// The rules of `sDefaultChannelRules` or `sLegacyChannelRules`.
 fn rules(legacy: bool) -> Vec<Rule> {
-    let rule = |suffix: &str, scheme: u8, pixel_type: i32, csc_idx: i32| Rule {
+    let rule = |suffix: &str, scheme: Scheme, pixel_type: PixelType, csc_idx: Option<usize>| Rule {
         suffix: suffix.as_bytes().to_vec(),
         scheme,
         pixel_type,
@@ -98,41 +126,41 @@ fn rules(legacy: bool) -> Vec<Rule> {
         case_insensitive: legacy,
     };
     let mut out = Vec::new();
-    let mut lossy = |suffix: &str, csc_idx: i32| {
-        out.push(rule(suffix, LOSSY_DCT, PIXEL_HALF, csc_idx));
-        out.push(rule(suffix, LOSSY_DCT, PIXEL_FLOAT, csc_idx));
+    let mut lossy = |suffix: &str, csc_idx: Option<usize>| {
+        out.push(rule(suffix, Scheme::LossyDct, PixelType::Half, csc_idx));
+        out.push(rule(suffix, Scheme::LossyDct, PixelType::Float, csc_idx));
     };
     if legacy {
         for (suffix, csc_idx) in [
-            ("r", 0),
-            ("red", 0),
-            ("g", 1),
-            ("grn", 1),
-            ("green", 1),
-            ("b", 2),
-            ("blu", 2),
-            ("blue", 2),
-            ("y", -1),
-            ("by", -1),
-            ("ry", -1),
+            ("r", Some(0)),
+            ("red", Some(0)),
+            ("g", Some(1)),
+            ("grn", Some(1)),
+            ("green", Some(1)),
+            ("b", Some(2)),
+            ("blu", Some(2)),
+            ("blue", Some(2)),
+            ("y", None),
+            ("by", None),
+            ("ry", None),
         ] {
             lossy(suffix, csc_idx);
         }
     } else {
         for (suffix, csc_idx) in [
-            ("R", 0),
-            ("G", 1),
-            ("B", 2),
-            ("Y", -1),
-            ("BY", -1),
-            ("RY", -1),
+            ("R", Some(0)),
+            ("G", Some(1)),
+            ("B", Some(2)),
+            ("Y", None),
+            ("BY", None),
+            ("RY", None),
         ] {
             lossy(suffix, csc_idx);
         }
     }
     let alpha = if legacy { "a" } else { "A" };
-    for pixel_type in [PIXEL_UINT, PIXEL_HALF, PIXEL_FLOAT] {
-        out.push(rule(alpha, RLE, pixel_type, -1));
+    for pixel_type in [PixelType::Uint, PixelType::Half, PixelType::Float] {
+        out.push(rule(alpha, Scheme::Rle, pixel_type, None));
     }
     out
 }
@@ -146,7 +174,7 @@ fn find_suffix(name: &[u8]) -> &[u8] {
 }
 
 /// `Classifier_match`.
-fn rule_matches(rule: &Rule, suffix: &[u8], pixel_type: i32) -> bool {
+fn rule_matches(rule: &Rule, suffix: &[u8], pixel_type: PixelType) -> bool {
     if rule.pixel_type != pixel_type {
         return false;
     }
@@ -165,24 +193,22 @@ fn rule_size(rule: &Rule) -> usize {
 fn write_rule(rule: &Rule, out: &mut Vec<u8>) {
     out.extend_from_slice(&rule.suffix);
     out.push(0);
-    let mut value = (((rule.csc_idx + 1) as u8) & 15) << 4;
-    value |= (rule.scheme & 3) << 2;
-    value |= u8::from(rule.case_insensitive);
-    out.push(value);
+    let csc = rule.csc_idx.map_or(0, |i| i as u8 + 1);
+    out.push((csc & 15) << 4 | (rule.scheme as u8 & 3) << 2 | u8::from(rule.case_insensitive));
     out.push(rule.pixel_type as u8);
 }
 
 /// `Classifier_read`: a rule from the start of `data`, and how many bytes it took.
-fn read_rule(data: &[u8]) -> Result<(Rule, usize), Code> {
+fn read_rule(data: &[u8]) -> Result<(Rule, usize), Error> {
     let size = data.len();
     if size <= 3 {
-        return Err(CORRUPT_CHUNK);
+        return Err(Error::CorruptChunk);
     }
     // (The suffix is no more than 128 bytes and its nil.)
     let mut len = 0usize;
     while len < 128 + 1 {
         if len > size - 3 {
-            return Err(CORRUPT_CHUNK);
+            return Err(Error::CorruptChunk);
         }
         if data[len] == 0 {
             break;
@@ -190,33 +216,29 @@ fn read_rule(data: &[u8]) -> Result<(Rule, usize), Code> {
         len += 1;
     }
     if len == 128 + 1 {
-        return Err(CORRUPT_CHUNK);
+        return Err(Error::CorruptChunk);
     }
     let suffix = data[..len].to_vec();
     len += 1;
     if size < len + 2 {
-        return Err(CORRUPT_CHUNK);
+        return Err(Error::CorruptChunk);
     }
     let value = data[len];
     let pixel_type = data[len + 1];
 
-    let csc_idx = i32::from(value >> 4) - 1;
-    if !(-1..3).contains(&csc_idx) {
-        return Err(CORRUPT_CHUNK);
-    }
-    let scheme = (value >> 2) & 3;
-    if scheme >= NUM_COMPRESSOR_SCHEMES {
-        return Err(CORRUPT_CHUNK);
-    }
+    let csc_idx = match value >> 4 {
+        0 => None,
+        n @ 1..=3 => Some(usize::from(n) - 1),
+        _ => return Err(Error::CorruptChunk),
+    };
+    let scheme = Scheme::from_code((value >> 2) & 3).ok_or(Error::CorruptChunk)?;
     let case_insensitive = value & 1 != 0;
-    if pixel_type >= 3 {
-        return Err(CORRUPT_CHUNK);
-    }
+    let pixel_type = PixelType::from_code(i32::from(pixel_type)).ok_or(Error::CorruptChunk)?;
     Ok((
         Rule {
             suffix,
             scheme,
-            pixel_type: i32::from(pixel_type),
+            pixel_type,
             csc_idx,
             case_insensitive,
         },
@@ -231,7 +253,7 @@ fn read_rule(data: &[u8]) -> Result<(Rule, usize), Code> {
 /// channels and the buffers they need.
 struct Layout {
     /// Each channel's compression.
-    compression: Vec<u8>,
+    compression: Vec<Scheme>,
     /// The channels converted to Y'CbCr together, red, green, blue.
     csc_sets: Vec<[usize; 3]>,
     out_buffer_size: usize,
@@ -239,14 +261,16 @@ struct Layout {
     packed_dc_size: usize,
     rle_buffer_size: usize,
     planar_size: [usize; 3],
+    /// The bytes of the channels kept whole by ZIP.
+    unknown_size: usize,
     /// Where each channel's data starts in its scheme's planar buffer.
     planar_at: Vec<usize>,
 }
 
-fn classify(channels: &[Channel], rules: &[Rule]) -> (Vec<u8>, Vec<[usize; 3]>) {
-    let mut compression = vec![UNKNOWN; channels.len()];
+fn classify(channels: &[Channel], rules: &[Rule]) -> (Vec<Scheme>, Vec<[usize; 3]>) {
+    let mut compression = vec![Scheme::Unknown; channels.len()];
     // (prefix, the channels of each of its colours)
-    let mut prefix_map: Vec<(&[u8], [i32; 3])> = Vec::new();
+    let mut prefix_map: Vec<(&[u8], [Option<usize>; 3])> = Vec::new();
     for (c, channel) in channels.iter().enumerate() {
         let name = channel.name.as_bytes();
         let suffix = find_suffix(name);
@@ -254,23 +278,22 @@ fn classify(channels: &[Channel], rules: &[Rule]) -> (Vec<u8>, Vec<[usize; 3]>) 
         let at = match prefix_map.iter().position(|(p, _)| *p == prefix) {
             Some(at) => at,
             None => {
-                prefix_map.push((prefix, [-1; 3]));
+                prefix_map.push((prefix, [None; 3]));
                 prefix_map.len() - 1
             }
         };
         for rule in rules {
             if rule_matches(rule, suffix, channel.pixel_type) {
                 compression[c] = rule.scheme;
-                if rule.csc_idx >= 0 {
-                    prefix_map[at].1[rule.csc_idx as usize] = c as i32;
+                if let Some(idx) = rule.csc_idx {
+                    prefix_map[at].1[idx] = Some(c);
                 }
             }
         }
     }
     let csc_sets = prefix_map
         .iter()
-        .filter(|(_, idx)| idx.iter().all(|&i| i >= 0))
-        .map(|(_, idx)| idx.map(|i| i as usize))
+        .filter_map(|&(_, [r, g, b])| Some([r?, g?, b?]))
         .collect();
     (compression, csc_sets)
 }
@@ -294,17 +317,17 @@ fn layout(channels: &[Channel], rules: &[Rule], width: usize, lines: usize) -> L
     for (c, channel) in channels.iter().enumerate() {
         let bpe = channel.bytes_per_element();
         match compression[c] {
-            LOSSY_DCT => {
+            Scheme::LossyDct => {
                 out_buffer_size += (2 * max_ac + 65536).max(compress_max_buffer_size(max_ac));
                 num_lossy += 1;
             }
-            RLE => {
+            Scheme::Rle => {
                 rle_buffer_size += 2 * pixel_count * bpe;
-                planar_size[RLE as usize] += 2 * pixel_count * bpe;
+                planar_size[Scheme::Rle as usize] += 2 * pixel_count * bpe;
             }
             _ => {
                 unknown_buffer_size += pixel_count * bpe;
-                planar_size[UNKNOWN as usize] += pixel_count * bpe;
+                planar_size[Scheme::Unknown as usize] += pixel_count * bpe;
             }
         }
     }
@@ -312,8 +335,9 @@ fn layout(channels: &[Channel], rules: &[Rule], width: usize, lines: usize) -> L
     out_buffer_size += compress_max_buffer_size(unknown_buffer_size);
     out_buffer_size += compress_max_buffer_size(max_dc * num_lossy);
     out_buffer_size += NUM_SIZES * 8;
-    if planar_size[UNKNOWN as usize] > 0 {
-        planar_size[UNKNOWN as usize] = compress_max_buffer_size(planar_size[UNKNOWN as usize]);
+    if planar_size[Scheme::Unknown as usize] > 0 {
+        planar_size[Scheme::Unknown as usize] =
+            compress_max_buffer_size(planar_size[Scheme::Unknown as usize]);
     }
 
     // DwaCompressor_setupChannelData
@@ -322,7 +346,7 @@ fn layout(channels: &[Channel], rules: &[Rule], width: usize, lines: usize) -> L
     for (c, channel) in channels.iter().enumerate() {
         let scheme = compression[c] as usize;
         planar_at.push(next[scheme]);
-        if compression[c] != LOSSY_DCT {
+        if compression[c] != Scheme::LossyDct {
             next[scheme] += width * lines * channel.bytes_per_element();
         }
     }
@@ -335,6 +359,7 @@ fn layout(channels: &[Channel], rules: &[Rule], width: usize, lines: usize) -> L
         packed_dc_size: max_dc * num_lossy,
         rle_buffer_size,
         planar_size,
+        unknown_size: unknown_buffer_size,
         planar_at,
     }
 }
@@ -356,9 +381,6 @@ const NUM_SIZES: usize = 11;
 /// How the AC coefficients are compressed.
 const STATIC_HUFFMAN: u64 = 0;
 const DEFLATE: u64 = 1;
-
-/// The zip level OpenEXRCore has for a part unless told otherwise (`-1`, libdeflate's 4).
-const ZIP_LEVEL: i32 = -1;
 
 // ---------------------------------------------------------------------------------------
 // RLE (`internal_rle.c`) and the byte order of ZIP (`internal_zip.c`).
@@ -489,19 +511,31 @@ fn zip_reconstruct_bytes(source: &mut [u8]) -> Vec<u8> {
 
 // ---------------------------------------------------------------------------------------
 
-/// `DwaCompressor_compress`: the block `raw` (its lines one after the other, each with its
-/// channels one after the other) of `width` pixels and `lines` lines compressed at
-/// `level` (`dwaCompressionLevel`), its AC coefficients by Huffman coding or (`deflate_ac`,
-/// as OpenEXRCore has it for tiles of DWAA) by ZIP. A block that does not come out smaller
-/// is given as it is.
+/// Compresses the block `raw` of `width` pixels and `lines` lines with DWAA or DWAB
+/// (`DwaCompressor_compress`).
+///
+/// `raw` holds the lines one after the other, each with its channels one after the other, in
+/// the order of `channels`, as little-endian values. `level` is the file's
+/// `dwaCompressionLevel` (OpenEXR's default is 45): higher is smaller and lossier. A block
+/// that does not come out smaller is returned as it is, as OpenEXR stores it.
+///
+/// Fails with [`Error::InvalidArgument`] when `raw` is not the length the channels, width and
+/// lines make.
 pub fn compress(
     raw: &[u8],
     channels: &[Channel],
     width: usize,
     lines: usize,
     level: f32,
-    deflate_ac: bool,
-) -> Vec<u8> {
+    ac_compression: AcCompression,
+) -> Result<Vec<u8>, Error> {
+    let line_size: usize = channels
+        .iter()
+        .map(|channel| width * channel.bytes_per_element())
+        .sum();
+    if line_size.checked_mul(lines) != Some(raw.len()) {
+        return Err(Error::InvalidArgument);
+    }
     let rules = rules(false);
     let layout = layout(channels, &rules, width, lines);
     let mut sizes = [0u64; NUM_SIZES];
@@ -525,13 +559,12 @@ pub fn compress(
     out[rules_at..rules_at + 2].copy_from_slice(&rule_size.to_le_bytes());
 
     sizes[VERSION] = 2;
-    sizes[AC_COMPRESSION] = if deflate_ac { DEFLATE } else { STATIC_HUFFMAN };
+    sizes[AC_COMPRESSION] = match ac_compression {
+        AcCompression::Huffman => STATIC_HUFFMAN,
+        AcCompression::Deflate => DEFLATE,
+    };
 
     // Where each channel's lines start in `raw`.
-    let line_size: usize = channels
-        .iter()
-        .map(|channel| width * channel.bytes_per_element())
-        .sum();
     let mut channel_at = Vec::with_capacity(channels.len());
     let mut at = 0usize;
     for channel in channels {
@@ -542,8 +575,7 @@ pub fn compress(
         |c: usize| -> Vec<usize> { (0..lines).map(|y| y * line_size + channel_at[c]).collect() };
 
     let quant_base_error = level / 100000.0;
-    let mut packed_ac: Vec<u16> = Vec::new();
-    let mut packed_dc: Vec<u16> = Vec::new();
+    let mut coefficients = lossy::Coefficients::default();
     let mut processed = vec![false; channels.len()];
 
     for set in &layout.csc_sets {
@@ -561,16 +593,16 @@ pub fn compress(
             true,
             width,
             lines,
-            &mut packed_ac,
-            &mut packed_dc,
+            &mut coefficients,
         );
         for &c in set {
             processed[c] = true;
         }
     }
 
-    let mut planar_unknown = vec![0u8; layout.planar_size[UNKNOWN as usize]];
-    let mut planar_rle = vec![0u8; layout.planar_size[RLE as usize]];
+    // (Only the bytes the channels fill: OpenEXRCore's buffers are larger.)
+    let mut planar_unknown = vec![0u8; layout.unknown_size];
+    let mut planar_rle = vec![0u8; layout.planar_size[Scheme::Rle as usize]];
     for (c, channel) in channels.iter().enumerate() {
         if processed[c] {
             continue;
@@ -578,7 +610,7 @@ pub fn compress(
         let bpe = channel.bytes_per_element();
         let row_bytes = width * bpe;
         match layout.compression[c] {
-            LOSSY_DCT => {
+            Scheme::LossyDct => {
                 let source = lossy::Source {
                     rows: rows(c),
                     pixel_type: channel.pixel_type,
@@ -587,14 +619,13 @@ pub fn compress(
                     raw,
                     &[source],
                     quant_base_error,
-                    !channel.p_linear,
+                    !channel.linear,
                     width,
                     lines,
-                    &mut packed_ac,
-                    &mut packed_dc,
+                    &mut coefficients,
                 );
             }
-            RLE => {
+            Scheme::Rle => {
                 // The first bytes of each value together, then the second, and so on.
                 let plane = width * lines;
                 let base = layout.planar_at[c];
@@ -620,12 +651,16 @@ pub fn compress(
         }
         processed[c] = true;
     }
+    let lossy::Coefficients {
+        ac: packed_ac,
+        dc: packed_dc,
+    } = coefficients;
     sizes[AC_UNCOMPRESSED_COUNT] = packed_ac.len() as u64;
     sizes[DC_UNCOMPRESSED_COUNT] = packed_dc.len() as u64;
 
     if sizes[UNKNOWN_UNCOMPRESSED_SIZE] > 0 {
         let packed = compress_buffer(
-            9,
+            Level::BEST,
             &planar_unknown[..sizes[UNKNOWN_UNCOMPRESSED_SIZE] as usize],
         );
         sizes[UNKNOWN_COMPRESSED_SIZE] = packed.len() as u64;
@@ -633,26 +668,29 @@ pub fn compress(
     }
 
     if !packed_ac.is_empty() {
-        if deflate_ac {
-            let bytes: Vec<u8> = packed_ac.iter().flat_map(|v| v.to_le_bytes()).collect();
-            let packed = compress_buffer(9, &bytes);
-            sizes[AC_COMPRESSED_SIZE] = packed.len() as u64;
-            out.extend_from_slice(&packed);
-        } else {
-            match huf::compress(&packed_ac, layout.out_buffer_size - out.len()) {
-                Ok(packed) => {
-                    sizes[AC_COMPRESSED_SIZE] = packed.len() as u64;
-                    out.extend_from_slice(&packed);
+        match ac_compression {
+            AcCompression::Deflate => {
+                let bytes: Vec<u8> = packed_ac.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let packed = compress_buffer(Level::BEST, &bytes);
+                sizes[AC_COMPRESSED_SIZE] = packed.len() as u64;
+                out.extend_from_slice(&packed);
+            }
+            AcCompression::Huffman => {
+                match huf::compress(&packed_ac, layout.out_buffer_size - out.len()) {
+                    Ok(packed) => {
+                        sizes[AC_COMPRESSED_SIZE] = packed.len() as u64;
+                        out.extend_from_slice(&packed);
+                    }
+                    // (Stored as it is, the block too large for the coder.)
+                    Err(_) => return Ok(raw.to_vec()),
                 }
-                // (Stored as it is, the block too large for the coder.)
-                Err(_) => return raw.to_vec(),
             }
         }
     }
 
     if !packed_dc.is_empty() {
         let bytes: Vec<u8> = packed_dc.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let packed = compress_buffer(ZIP_LEVEL, &zip_deconstruct_bytes(&bytes));
+        let packed = compress_buffer(DEFAULT_LEVEL, &zip_deconstruct_bytes(&bytes));
         sizes[DC_COMPRESSED_SIZE] = packed.len() as u64;
         out.extend_from_slice(&packed);
     }
@@ -663,7 +701,7 @@ pub fn compress(
             layout.rle_buffer_size,
         );
         sizes[RLE_UNCOMPRESSED_SIZE] = rle.len() as u64;
-        let packed = compress_buffer(9, &rle);
+        let packed = compress_buffer(Level::BEST, &rle);
         sizes[RLE_COMPRESSED_SIZE] = packed.len() as u64;
         out.extend_from_slice(&packed);
     }
@@ -672,24 +710,28 @@ pub fn compress(
         out[8 * i..8 * i + 8].copy_from_slice(&size.to_le_bytes());
     }
     if out.len() >= raw.len() {
-        return raw.to_vec();
+        return Ok(raw.to_vec());
     }
-    out
+    Ok(out)
 }
 
-/// `DwaCompressor_uncompress`: the block `data` into `out`, which is as long as its lines,
-/// or OpenEXRCore's code for why not.
-pub fn uncompress(
+/// Decompresses the DWAA or DWAB block `data` of `width` pixels and `lines` lines into `out`
+/// (`DwaCompressor_uncompress`).
+///
+/// `out` is the block's uncompressed size, and receives its lines as [`compress`] takes them.
+/// A block that OpenEXRCore refuses fails with the [`Error`] it reports, most often
+/// [`Error::CorruptChunk`].
+pub fn decompress(
     data: &[u8],
     channels: &[Channel],
     width: usize,
     lines: usize,
     out: &mut [u8],
-) -> Result<(), Code> {
+) -> Result<(), Error> {
     let header_size = (NUM_SIZES * 8) as u64;
     let i_size = data.len() as u64;
     if i_size < header_size {
-        return Err(CORRUPT_CHUNK);
+        return Err(Error::CorruptChunk);
     }
     out.fill(0);
     let uncompressed_size = out.len() as u64;
@@ -704,8 +746,8 @@ pub fn uncompress(
     let rle_compressed_size = counter(RLE_COMPRESSED_SIZE);
     let rle_uncompressed_size = counter(RLE_UNCOMPRESSED_SIZE);
     let rle_raw_size = counter(RLE_RAW_SIZE);
-    let mut total_ac_count = counter(AC_UNCOMPRESSED_COUNT);
-    let mut total_dc_count = counter(DC_UNCOMPRESSED_COUNT);
+    let total_ac_count = counter(AC_UNCOMPRESSED_COUNT);
+    let total_dc_count = counter(DC_UNCOMPRESSED_COUNT);
     let ac_compression = counter(AC_COMPRESSION);
 
     let compressed_size = unknown_compressed_size
@@ -720,13 +762,13 @@ pub fn uncompress(
         || i_size < dc_compressed_size
         || i_size < rle_compressed_size
     {
-        return Err(CORRUPT_CHUNK);
+        return Err(Error::CorruptChunk);
     }
     if unknown_uncompressed_size > uncompressed_size
         || rle_raw_size > uncompressed_size
         || unknown_uncompressed_size.wrapping_add(rle_raw_size) > uncompressed_size
     {
-        return Err(CORRUPT_CHUNK);
+        return Err(Error::CorruptChunk);
     }
     if [
         unknown_uncompressed_size,
@@ -742,7 +784,7 @@ pub fn uncompress(
     .iter()
     .any(|&size| (size as i64) < 0)
     {
-        return Err(CORRUPT_CHUNK);
+        return Err(Error::CorruptChunk);
     }
 
     let mut data_at = header_size as usize;
@@ -752,14 +794,14 @@ pub fn uncompress(
         // DwaCompressor_readChannelRules
         let n_avail = data.len() - data_at;
         if n_avail <= 2 {
-            return Err(CORRUPT_CHUNK);
+            return Err(Error::CorruptChunk);
         }
         let rule_size = usize::from(u16::from_le_bytes([data[data_at], data[data_at + 1]]));
         if rule_size < 2 {
-            return Err(CORRUPT_CHUNK);
+            return Err(Error::CorruptChunk);
         }
         if n_avail < rule_size {
-            return Err(CORRUPT_CHUNK);
+            return Err(Error::CorruptChunk);
         }
         let mut rule_data = &data[data_at + 2..data_at + rule_size];
         data_at += rule_size;
@@ -782,16 +824,16 @@ pub fn uncompress(
     let rle_at = dc_at + dc_compressed_size;
     if ac_at > i_size || dc_at > i_size || rle_at > i_size || rle_at + rle_compressed_size > i_size
     {
-        return Err(CORRUPT_CHUNK);
+        return Err(Error::CorruptChunk);
     }
 
     if version > 2 {
-        return Err(BAD_CHUNK_LEADER);
+        return Err(Error::BadChunkLeader);
     }
 
     // validate_size
     let validate =
-        |scheme: u8, compressed: u64, uncompressed: u64, extra: u64| -> Result<(), Code> {
+        |scheme: Scheme, compressed: u64, uncompressed: u64, extra: u64| -> Result<(), Error> {
             let required: u64 = channels
                 .iter()
                 .enumerate()
@@ -800,21 +842,21 @@ pub fn uncompress(
                 .sum();
             if required > 0 {
                 if uncompressed < required || compressed == 0 {
-                    return Err(CORRUPT_CHUNK);
+                    return Err(Error::CorruptChunk);
                 }
             } else if uncompressed > 0 || compressed > 0 || extra > 0 {
-                return Err(CORRUPT_CHUNK);
+                return Err(Error::CorruptChunk);
             }
             Ok(())
         };
     validate(
-        UNKNOWN,
+        Scheme::Unknown,
         unknown_compressed_size,
         unknown_uncompressed_size,
         0,
     )?;
     validate(
-        RLE,
+        Scheme::Rle,
         rle_compressed_size,
         rle_raw_size,
         rle_uncompressed_size,
@@ -822,25 +864,26 @@ pub fn uncompress(
 
     let part = |at: u64, size: u64| &data[at as usize..(at + size) as usize];
 
-    let mut planar_unknown = vec![0u8; layout.planar_size[UNKNOWN as usize]];
+    // (Only the bytes the stream holds or the channels read: OpenEXRCore's buffer is larger.)
+    if unknown_uncompressed_size > layout.planar_size[Scheme::Unknown as usize] as u64 {
+        return Err(Error::CorruptChunk);
+    }
+    let mut planar_unknown = vec![0u8; layout.unknown_size.max(unknown_uncompressed_size as usize)];
     if unknown_compressed_size > 0 {
-        if unknown_uncompressed_size > planar_unknown.len() as u64 {
-            return Err(CORRUPT_CHUNK);
-        }
         let made = uncompress_buffer(
             part(unknown_at, unknown_compressed_size),
             &mut planar_unknown[..unknown_uncompressed_size as usize],
         )
-        .map_err(|_| CORRUPT_CHUNK)?;
+        .map_err(|_| Error::CorruptChunk)?;
         if made as u64 != unknown_uncompressed_size {
-            return Err(CORRUPT_CHUNK);
+            return Err(Error::CorruptChunk);
         }
     }
 
     let mut packed_ac = vec![0u16; layout.packed_ac_size / 2];
     if ac_compressed_size > 0 {
         if layout.packed_ac_size == 0 || total_ac_count * 2 > layout.packed_ac_size as u64 {
-            return Err(CORRUPT_CHUNK);
+            return Err(Error::CorruptChunk);
         }
         let count = total_ac_count as usize;
         match ac_compression {
@@ -851,13 +894,13 @@ pub fn uncompress(
                 let mut bytes = vec![0u8; count * 2];
                 let made = uncompress_buffer(part(ac_at, ac_compressed_size), &mut bytes)?;
                 if made != count * 2 {
-                    return Err(CORRUPT_CHUNK);
+                    return Err(Error::CorruptChunk);
                 }
                 for (value, pair) in packed_ac.iter_mut().zip(bytes.as_chunks::<2>().0.iter()) {
                     *value = u16::from_le_bytes([pair[0], pair[1]]);
                 }
             }
-            _ => return Err(CORRUPT_CHUNK),
+            _ => return Err(Error::CorruptChunk),
         }
     }
 
@@ -865,12 +908,12 @@ pub fn uncompress(
     if dc_compressed_size > 0 {
         let uncomp_bytes = total_dc_count * 2;
         if uncomp_bytes > layout.packed_dc_size as u64 {
-            return Err(CORRUPT_CHUNK);
+            return Err(Error::CorruptChunk);
         }
         let mut scratch = vec![0u8; uncomp_bytes as usize];
         match uncompress_buffer(part(dc_at, dc_compressed_size), &mut scratch) {
             Ok(made) if made as u64 == uncomp_bytes => {}
-            _ => return Err(CORRUPT_CHUNK),
+            _ => return Err(Error::CorruptChunk),
         }
         let bytes = zip_reconstruct_bytes(&mut scratch);
         for (value, pair) in packed_dc.iter_mut().zip(bytes.as_chunks::<2>().0.iter()) {
@@ -878,23 +921,23 @@ pub fn uncompress(
         }
     } else if total_dc_count != 0 {
         // if the compressed size is 0, then the uncompressed size must also be zero
-        return Err(CORRUPT_CHUNK);
+        return Err(Error::CorruptChunk);
     }
 
-    let mut planar_rle = vec![0u8; layout.planar_size[RLE as usize]];
+    let mut planar_rle = vec![0u8; layout.planar_size[Scheme::Rle as usize]];
     if rle_raw_size > 0 {
         if rle_uncompressed_size > layout.rle_buffer_size as u64
             || rle_raw_size > planar_rle.len() as u64
         {
-            return Err(CORRUPT_CHUNK);
+            return Err(Error::CorruptChunk);
         }
         let mut rle = vec![0u8; rle_uncompressed_size as usize];
         match uncompress_buffer(part(rle_at, rle_compressed_size), &mut rle) {
             Ok(made) if made as u64 == rle_uncompressed_size => {}
-            _ => return Err(CORRUPT_CHUNK),
+            _ => return Err(Error::CorruptChunk),
         }
         if rle_decompress(&mut planar_rle[..rle_raw_size as usize], &rle) as u64 != rle_raw_size {
-            return Err(CORRUPT_CHUNK);
+            return Err(Error::CorruptChunk);
         }
     }
 
@@ -913,13 +956,22 @@ pub fn uncompress(
         |c: usize| -> Vec<usize> { (0..lines).map(|y| y * line_size + channel_at[c]).collect() };
 
     let mut decoder = lossy::Decoder::new(channels.len());
-    let mut ac_at = 0usize;
-    let mut dc_at = 0usize;
+    let mut packed = lossy::Packed {
+        ac: &packed_ac,
+        ac_at: 0,
+        ac_left: total_ac_count,
+        dc: &packed_dc,
+        dc_at: 0,
+        dc_left: total_dc_count,
+    };
     let mut processed = vec![false; channels.len()];
 
     for set in &layout.csc_sets {
-        if set.iter().any(|&c| layout.compression[c] != LOSSY_DCT) {
-            return Err(CORRUPT_CHUNK);
+        if set
+            .iter()
+            .any(|&c| layout.compression[c] != Scheme::LossyDct)
+        {
+            return Err(Error::CorruptChunk);
         }
         let targets: Vec<lossy::Target> = set
             .iter()
@@ -929,23 +981,7 @@ pub fn uncompress(
                 pixel_type: channels[c].pixel_type,
             })
             .collect();
-        let result = decoder.decode(
-            out,
-            &targets,
-            &packed_ac,
-            ac_at,
-            total_ac_count,
-            &packed_dc,
-            dc_at,
-            total_dc_count,
-            true,
-            width,
-            lines,
-        );
-        ac_at += decoder.ac_count;
-        dc_at += decoder.dc_count;
-        total_ac_count -= decoder.ac_count as u64;
-        total_dc_count -= decoder.dc_count as u64;
+        let result = decoder.decode(out, &targets, &mut packed, true, width, lines);
         for &c in set {
             processed[c] = true;
         }
@@ -962,32 +998,17 @@ pub fn uncompress(
         }
         let bpe = channel.bytes_per_element();
         match layout.compression[c] {
-            LOSSY_DCT => {
+            Scheme::LossyDct => {
                 let target = lossy::Target {
                     channel: c,
                     rows: rows(c),
                     pixel_type: channel.pixel_type,
                 };
-                let result = decoder.decode(
-                    out,
-                    &[target],
-                    &packed_ac,
-                    ac_at,
-                    total_ac_count,
-                    &packed_dc,
-                    dc_at,
-                    total_dc_count,
-                    !channel.p_linear,
-                    width,
-                    lines,
-                );
-                ac_at += decoder.ac_count;
-                dc_at += decoder.dc_count;
-                total_ac_count -= decoder.ac_count as u64;
-                total_dc_count -= decoder.dc_count as u64;
+                let result =
+                    decoder.decode(out, &[target], &mut packed, !channel.linear, width, lines);
                 result?;
             }
-            RLE => {
+            Scheme::Rle => {
                 let plane = width * lines;
                 let base = layout.planar_at[c];
                 let mut end = [0usize; 4];
@@ -1000,19 +1021,18 @@ pub fn uncompress(
                     }
                 }
             }
-            UNKNOWN => {
+            Scheme::Unknown => {
                 let row_bytes = width * bpe;
                 let mut at = layout.planar_at[c];
                 for row in rows(c) {
                     // sanity check for buffer data lying within range
                     if at + row_bytes > planar_unknown.len() {
-                        return Err(CORRUPT_CHUNK);
+                        return Err(Error::CorruptChunk);
                     }
                     out[row..row + row_bytes].copy_from_slice(&planar_unknown[at..at + row_bytes]);
                     at += row_bytes;
                 }
             }
-            _ => return Err(CORRUPT_CHUNK),
         }
         processed[c] = true;
     }
@@ -1034,7 +1054,7 @@ mod tests {
             for (c, channel) in channels.iter().enumerate() {
                 for x in 0..width {
                     let v = value(c, x, y);
-                    if channel.pixel_type == PIXEL_HALF {
+                    if channel.pixel_type == PixelType::Half {
                         raw.extend_from_slice(&(v as u16).to_le_bytes());
                     } else {
                         raw.extend_from_slice(&v.to_le_bytes());
@@ -1050,13 +1070,13 @@ mod tests {
         let channels = [
             Channel {
                 name: "A",
-                pixel_type: PIXEL_HALF,
-                p_linear: false,
+                pixel_type: PixelType::Half,
+                linear: false,
             },
             Channel {
                 name: "id",
-                pixel_type: PIXEL_UINT,
-                p_linear: false,
+                pixel_type: PixelType::Uint,
+                linear: false,
             },
         ];
         let raw = block(37, 32, &channels, |c, x, y| {
@@ -1066,10 +1086,10 @@ mod tests {
                 (x / 5 + y / 3) as u32
             }
         });
-        let packed = compress(&raw, &channels, 37, 32, 45.0, false);
+        let packed = compress(&raw, &channels, 37, 32, 45.0, AcCompression::Huffman).unwrap();
         assert!(packed.len() < raw.len() / 4);
         let mut out = vec![0u8; raw.len()];
-        uncompress(&packed, &channels, 37, 32, &mut out).unwrap();
+        decompress(&packed, &channels, 37, 32, &mut out).unwrap();
         assert_eq!(out, raw);
     }
 
@@ -1079,19 +1099,19 @@ mod tests {
             .iter()
             .map(|name| Channel {
                 name,
-                pixel_type: PIXEL_HALF,
-                p_linear: false,
+                pixel_type: PixelType::Half,
+                linear: false,
             })
             .collect();
         let half = |f: f32| simd::float_to_half(f) as u32;
         let raw = block(64, 40, &channels, |c, x, y| {
             half(0.25 + (x + 2 * y + 9 * c) as f32 / 200.0)
         });
-        for deflate_ac in [false, true] {
-            let packed = compress(&raw, &channels, 64, 40, 45.0, deflate_ac);
+        for ac in [AcCompression::Huffman, AcCompression::Deflate] {
+            let packed = compress(&raw, &channels, 64, 40, 45.0, ac).unwrap();
             assert!(packed.len() < raw.len() / 3);
             let mut out = vec![0u8; raw.len()];
-            uncompress(&packed, &channels, 64, 40, &mut out).unwrap();
+            decompress(&packed, &channels, 64, 40, &mut out).unwrap();
             for (a, b) in raw
                 .as_chunks::<2>()
                 .0
@@ -1111,22 +1131,26 @@ mod tests {
     fn damage_is_refused() {
         let channels = [Channel {
             name: "Y",
-            pixel_type: PIXEL_FLOAT,
-            p_linear: false,
+            pixel_type: PixelType::Float,
+            linear: false,
         }];
         let raw = block(16, 16, &channels, |_, x, y| {
             (0.5 + (x * y) as f32 / 512.0).to_bits()
         });
-        let mut packed = compress(&raw, &channels, 16, 16, 45.0, false);
+        let mut packed = compress(&raw, &channels, 16, 16, 45.0, AcCompression::Huffman).unwrap();
+        assert_eq!(
+            compress(&raw[1..], &channels, 16, 16, 45.0, AcCompression::Huffman),
+            Err(Error::InvalidArgument)
+        );
         let mut out = vec![0u8; raw.len()];
         assert_eq!(
-            uncompress(&packed[..40], &channels, 16, 16, &mut out),
-            Err(CORRUPT_CHUNK)
+            decompress(&packed[..40], &channels, 16, 16, &mut out),
+            Err(Error::CorruptChunk)
         );
         packed[0] = 3;
         assert_eq!(
-            uncompress(&packed, &channels, 16, 16, &mut out),
-            Err(BAD_CHUNK_LEADER)
+            decompress(&packed, &channels, 16, 16, &mut out),
+            Err(Error::BadChunkLeader)
         );
     }
 }

@@ -2,7 +2,7 @@
 //! DWAA and DWAB: a port of `internal_huf.c` of OpenEXR v3.5.4, with both of its decoders
 //! (the table one for streams of 128 bits or less, the fast one, on x86, for longer ones).
 
-use crate::{ARGUMENT_OUT_OF_RANGE, CORRUPT_CHUNK, Code, INVALID_ARGUMENT, OUT_OF_MEMORY};
+use crate::Error;
 
 const HUF_ENCBITS: u32 = 16;
 const HUF_DECBITS: u32 = 14;
@@ -183,12 +183,12 @@ struct BitWriter {
 }
 
 impl BitWriter {
-    fn output_bits(&mut self, n_bits: u32, bits: u64) -> Result<(), Code> {
+    fn output_bits(&mut self, n_bits: u32, bits: u64) -> Result<(), Error> {
         self.c = (self.c << n_bits) | bits;
         self.lc += n_bits;
         while self.lc >= 8 {
             if self.out.len() >= self.max {
-                return Err(ARGUMENT_OUT_OF_RANGE);
+                return Err(Error::ArgumentOutOfRange);
             }
             self.lc -= 8;
             self.out.push((self.c >> self.lc) as u8);
@@ -196,12 +196,12 @@ impl BitWriter {
         Ok(())
     }
 
-    fn output_code(&mut self, code: u64) -> Result<(), Code> {
+    fn output_code(&mut self, code: u64) -> Result<(), Error> {
         self.output_bits(huf_length(code), huf_code(code))
     }
 
     /// `sendCode`.
-    fn send_code(&mut self, s_code: u64, run_count: i32, run_code: u64) -> Result<(), Code> {
+    fn send_code(&mut self, s_code: u64, run_count: i32, run_code: u64) -> Result<(), Error> {
         if ((huf_length(s_code) + huf_length(run_code) + 8) as i32)
             < huf_length(s_code) as i32 * run_count
         {
@@ -219,10 +219,10 @@ impl BitWriter {
     }
 
     /// The last bits, as a byte filled out with zeros.
-    fn finish(&mut self) -> Result<(), Code> {
+    fn finish(&mut self) -> Result<(), Error> {
         if self.lc > 0 {
             if self.out.len() >= self.max {
-                return Err(ARGUMENT_OUT_OF_RANGE);
+                return Err(Error::ArgumentOutOfRange);
             }
             self.out.push((self.c << (8 - self.lc)) as u8);
         }
@@ -231,7 +231,7 @@ impl BitWriter {
 }
 
 /// `hufPackEncTable`: the lengths of the codes from `im` to `i_max`.
-fn pack_enc_table(hcode: &[u64], mut im: u32, i_max: u32, w: &mut BitWriter) -> Result<(), Code> {
+fn pack_enc_table(hcode: &[u64], mut im: u32, i_max: u32, w: &mut BitWriter) -> Result<(), Error> {
     while im <= i_max {
         let l = huf_length(hcode[im as usize]);
         if l == 0 {
@@ -261,12 +261,12 @@ fn pack_enc_table(hcode: &[u64], mut im: u32, i_max: u32, w: &mut BitWriter) -> 
 }
 
 /// `internal_huf_compress`: `raw` Huffman-coded into no more than `outsz` bytes.
-pub(super) fn compress(raw: &[u16], outsz: usize) -> Result<Vec<u8>, Code> {
+pub(super) fn compress(raw: &[u16], outsz: usize) -> Result<Vec<u8>, Error> {
     if raw.is_empty() {
         return Ok(Vec::new());
     }
     if outsz < 20 {
-        return Err(INVALID_ARGUMENT);
+        return Err(Error::InvalidArgument);
     }
     let mut freq = vec![0u64; HUF_ENCSIZE];
     for &value in raw {
@@ -304,13 +304,13 @@ pub(super) fn compress(raw: &[u16], outsz: usize) -> Result<Vec<u8>, Code> {
     let lc = w.lc;
     if lc != 0 {
         if w.out.len() >= w.max {
-            return Err(ARGUMENT_OUT_OF_RANGE);
+            return Err(Error::ArgumentOutOfRange);
         }
         w.out.push((w.c << (8 - lc)) as u8);
     }
     let n_bits = ((w.out.len() - data_start - usize::from(lc != 0)) * 8) as u64 + u64::from(lc);
     if n_bits > u64::from(u32::MAX) {
-        return Err(ARGUMENT_OUT_OF_RANGE);
+        return Err(Error::ArgumentOutOfRange);
     }
     let mut out = w.out;
     out[0..4].copy_from_slice(&im.to_le_bytes());
@@ -344,7 +344,7 @@ fn unpack_enc_table(
     mut im: u32,
     i_max: u32,
     hcode: &mut [u64],
-) -> Result<(), Code> {
+) -> Result<(), Error> {
     let start = *at;
     let mut p = *at;
     let mut c = 0u64;
@@ -354,18 +354,18 @@ fn unpack_enc_table(
     while im <= i_max {
         let nr = (p - start) as u64;
         if lc < 6 && nr >= ni {
-            return Err(OUT_OF_MEMORY);
+            return Err(Error::OutOfMemory);
         }
         let l = get_bits(6, &mut c, &mut lc, input, &mut p);
         hcode[im as usize] = l;
         if l == LONG_ZEROCODE_RUN {
             let nr = (p - start) as u64;
             if lc < 8 && nr >= ni {
-                return Err(OUT_OF_MEMORY);
+                return Err(Error::OutOfMemory);
             }
             let zerun = get_bits(8, &mut c, &mut lc, input, &mut p) + SHORTEST_LONG_RUN;
             if u64::from(im) + zerun > u64::from(i_max) + 1 {
-                return Err(CORRUPT_CHUNK);
+                return Err(Error::CorruptChunk);
             }
             for _ in 0..zerun {
                 hcode[im as usize] = 0;
@@ -375,7 +375,7 @@ fn unpack_enc_table(
         } else if l >= SHORT_ZEROCODE_RUN {
             let zerun = l - SHORT_ZEROCODE_RUN + 2;
             if u64::from(im) + zerun > u64::from(i_max) + 1 {
-                return Err(CORRUPT_CHUNK);
+                return Err(Error::CorruptChunk);
             }
             for _ in 0..zerun {
                 hcode[im as usize] = 0;
@@ -406,17 +406,17 @@ fn build_dec_table(
     mut im: u32,
     i_max: u32,
     hdecod: &mut [HufDec],
-) -> Result<(), Code> {
+) -> Result<(), Error> {
     while im <= i_max {
         let c = huf_code(hcode[im as usize]);
         let l = huf_length(hcode[im as usize]);
         if l < 64 && (c >> l) != 0 {
-            return Err(CORRUPT_CHUNK);
+            return Err(Error::CorruptChunk);
         }
         if l > HUF_DECBITS {
             let pl = &mut hdecod[(c >> (l - HUF_DECBITS)) as usize];
             if pl.len != 0 {
-                return Err(CORRUPT_CHUNK);
+                return Err(Error::CorruptChunk);
             }
             pl.lit += 1;
             pl.p.get_or_insert_with(Vec::new).push(im);
@@ -424,7 +424,7 @@ fn build_dec_table(
             let start = (c << (HUF_DECBITS - l)) as usize;
             for pl in &mut hdecod[start..start + (1usize << (HUF_DECBITS - l))] {
                 if pl.len != 0 || pl.p.is_some() {
-                    return Err(CORRUPT_CHUNK);
+                    return Err(Error::CorruptChunk);
                 }
                 pl.len = l;
                 pl.lit = im;
@@ -447,11 +447,11 @@ fn get_code(
     ie: usize,
     out: &mut [u16],
     o: &mut usize,
-) -> Result<(), Code> {
+) -> Result<(), Error> {
     if po == rlc {
         if *lc < 8 {
             if *at >= ie {
-                return Err(OUT_OF_MEMORY);
+                return Err(Error::OutOfMemory);
             }
             *c = (*c << 8) | u64::from(input[*at]);
             *at += 1;
@@ -460,9 +460,9 @@ fn get_code(
         *lc -= 8;
         let cs = (*c >> *lc) as u8 as usize;
         if *o + cs > out.len() {
-            return Err(CORRUPT_CHUNK);
+            return Err(Error::CorruptChunk);
         } else if *o == 0 {
-            return Err(OUT_OF_MEMORY);
+            return Err(Error::OutOfMemory);
         }
         let s = out[*o - 1];
         out[*o..*o + cs].fill(s);
@@ -471,7 +471,7 @@ fn get_code(
         out[*o] = po as u16;
         *o += 1;
     } else {
-        return Err(CORRUPT_CHUNK);
+        return Err(Error::CorruptChunk);
     }
     Ok(())
 }
@@ -485,7 +485,7 @@ fn decode(
     ni: u64,
     rlc: u32,
     out: &mut [u16],
-) -> Result<(), Code> {
+) -> Result<(), Error> {
     let mut c = 0u64;
     let mut lc = 0i32;
     let mut o = 0usize;
@@ -501,7 +501,7 @@ fn decode(
             let pl = &hdecod[decoffset as usize];
             if pl.len != 0 {
                 if pl.len as i32 > lc {
-                    return Err(CORRUPT_CHUNK);
+                    return Err(Error::CorruptChunk);
                 }
                 lc -= pl.len as i32;
                 get_code(
@@ -509,7 +509,7 @@ fn decode(
                 )?;
             } else {
                 let Some(decbuf) = &pl.p else {
-                    return Err(CORRUPT_CHUNK);
+                    return Err(Error::CorruptChunk);
                 };
                 let mut found = false;
                 for &sym in decbuf.iter().take(pl.lit as usize) {
@@ -529,7 +529,7 @@ fn decode(
                     }
                 }
                 if !found {
-                    return Err(CORRUPT_CHUNK);
+                    return Err(Error::CorruptChunk);
                 }
             }
         }
@@ -544,18 +544,18 @@ fn decode(
         let pl = &hdecod[decoffset as usize];
         if pl.len != 0 {
             if pl.len as i32 > lc {
-                return Err(CORRUPT_CHUNK);
+                return Err(Error::CorruptChunk);
             }
             lc -= pl.len as i32;
             get_code(
                 pl.lit, rlc, &mut c, &mut lc, input, &mut at, ie, out, &mut o,
             )?;
         } else {
-            return Err(CORRUPT_CHUNK);
+            return Err(Error::CorruptChunk);
         }
     }
     if o != out.len() {
-        return Err(OUT_OF_MEMORY);
+        return Err(Error::OutOfMemory);
     }
     Ok(())
 }
@@ -611,7 +611,7 @@ impl FastHufDecoder {
         min_symbol: u32,
         max_symbol: u32,
         rle_symbol: i32,
-    ) -> Result<FastHufDecoder, Code> {
+    ) -> Result<FastHufDecoder, Error> {
         let mut base = [u64::MAX; MAX_CODE_LEN + 1];
         let mut offset = [0u64; MAX_CODE_LEN + 1];
         let mut code_count = [0usize; MAX_CODE_LEN + 1];
@@ -634,7 +634,7 @@ impl FastHufDecoder {
         let mut symbol = u64::from(min_symbol);
         while symbol <= u64::from(max_symbol) {
             if curr as u64 >= top_byte {
-                return Err(CORRUPT_CHUNK);
+                return Err(Error::CorruptChunk);
             }
             let code_len = fast_read_bits(6, &mut curr_bits, &mut curr_bit_count, input, &mut curr);
             if code_len < SHORT_ZEROCODE_RUN {
@@ -647,7 +647,7 @@ impl FastHufDecoder {
                 code_count[code_len as usize] += 1;
             } else if code_len == LONG_ZEROCODE_RUN {
                 if curr as u64 >= top_byte {
-                    return Err(CORRUPT_CHUNK);
+                    return Err(Error::CorruptChunk);
                 }
                 symbol += fast_read_bits(8, &mut curr_bits, &mut curr_bit_count, input, &mut curr)
                     + SHORTEST_LONG_RUN
@@ -656,7 +656,7 @@ impl FastHufDecoder {
                 symbol += code_len - SHORT_ZEROCODE_RUN + 1;
             }
             if symbol > u64::from(max_symbol) {
-                return Err(CORRUPT_CHUNK);
+                return Err(Error::CorruptChunk);
             }
             symbol += 1;
         }
@@ -665,7 +665,7 @@ impl FastHufDecoder {
             fhd.num_symbols = fhd.num_symbols.wrapping_add(count as u32);
         }
         if fhd.num_symbols as usize > fhd.id_to_symbol.len() {
-            return Err(CORRUPT_CHUNK);
+            return Err(Error::CorruptChunk);
         }
 
         // Compute base - once we have the code length counts, there is a closed form
@@ -709,7 +709,7 @@ impl FastHufDecoder {
                     continue;
                 }
                 if mapping[code_len as usize] >= u64::from(fhd.num_symbols) {
-                    return Err(CORRUPT_CHUNK);
+                    return Err(Error::CorruptChunk);
                 }
                 fhd.id_to_symbol[mapping[code_len as usize] as usize] = symbol as u32;
                 mapping[code_len as usize] += 1;
@@ -732,10 +732,10 @@ impl FastHufDecoder {
         &mut self,
         base: &[u64; MAX_CODE_LEN + 1],
         offset: &[u64; MAX_CODE_LEN + 1],
-    ) -> Result<(), Code> {
-        for i in 0..=MAX_CODE_LEN {
-            self.lj_base[i] = if base[i] != u64::MAX {
-                base[i].wrapping_shl(64 - i as u32)
+    ) -> Result<(), Error> {
+        for (i, (lj_base, &base)) in self.lj_base.iter_mut().zip(base).enumerate() {
+            *lj_base = if base != u64::MAX {
+                base.wrapping_shl(64 - i as u32)
             } else {
                 u64::MAX
             };
@@ -743,8 +743,8 @@ impl FastHufDecoder {
         self.lj_base[MAX_CODE_LEN + 1] = 0;
 
         self.lj_offset[0] = offset[0].wrapping_sub(self.lj_base[0]);
-        for i in 1..=MAX_CODE_LEN {
-            self.lj_offset[i] = offset[i].wrapping_sub(self.lj_base[i] >> (64 - i));
+        for (i, (lj_offset, &offset)) in self.lj_offset.iter_mut().zip(offset).enumerate().skip(1) {
+            *lj_offset = offset.wrapping_sub(self.lj_base[i] >> (64 - i));
         }
 
         for i in 0..1u64 << TABLE_LOOKUP_BITS {
@@ -758,7 +758,7 @@ impl FastHufDecoder {
                     if id < u64::from(self.num_symbols) {
                         self.table_symbol[i as usize] = self.id_to_symbol[id as usize] as i32;
                     } else {
-                        return Err(CORRUPT_CHUNK);
+                        return Err(Error::CorruptChunk);
                     }
                     break;
                 }
@@ -837,7 +837,7 @@ impl FastHufDecoder {
         src: usize,
         num_src_bits: u64,
         dst: &mut [u16],
-    ) -> Result<(), Code> {
+    ) -> Result<(), Error> {
         let mut curr = src + 16;
         let mut num_src_bits = num_src_bits - 128;
         let mut buffer = read64(input, src);
@@ -872,13 +872,13 @@ impl FastHufDecoder {
                     len += 1;
                 }
                 if len > self.max_code_length as usize {
-                    return Err(CORRUPT_CHUNK);
+                    return Err(Error::CorruptChunk);
                 }
                 let id = self.lj_offset[len].wrapping_add(buffer >> (64 - len));
                 if id < u64::from(self.num_symbols) {
                     symbol = self.id_to_symbol[id as usize] as i32;
                 } else {
-                    return Err(CORRUPT_CHUNK);
+                    return Err(Error::CorruptChunk);
                 }
                 code_len = len as u32;
             }
@@ -901,13 +901,13 @@ impl FastHufDecoder {
                 }
                 let rle_count = (buffer >> 56) as u32;
                 if dst_idx < 1 {
-                    return Err(CORRUPT_CHUNK);
+                    return Err(Error::CorruptChunk);
                 }
                 if dst_idx as u64 + u64::from(rle_count) > dst.len() as u64 {
-                    return Err(CORRUPT_CHUNK);
+                    return Err(Error::CorruptChunk);
                 }
                 if rle_count == 0 || rle_count >= i32::MAX as u32 {
-                    return Err(CORRUPT_CHUNK);
+                    return Err(Error::CorruptChunk);
                 }
                 let previous = dst[dst_idx - 1];
                 dst[dst_idx..dst_idx + rle_count as usize].fill(previous);
@@ -933,19 +933,19 @@ impl FastHufDecoder {
             }
         }
         if num_src_bits != 0 {
-            return Err(CORRUPT_CHUNK);
+            return Err(Error::CorruptChunk);
         }
         Ok(())
     }
 }
 
 /// `internal_huf_decompress`: `compressed` into `raw`.
-pub(super) fn decompress(compressed: &[u8], raw: &mut [u16]) -> Result<(), Code> {
+pub(super) fn decompress(compressed: &[u8], raw: &mut [u16]) -> Result<(), Error> {
     let n_compressed = compressed.len() as u64;
     let huf_info_block_size = 20u64;
     if n_compressed < 20 {
         if !raw.is_empty() {
-            return Err(INVALID_ARGUMENT);
+            return Err(Error::InvalidArgument);
         }
         return Ok(());
     }
@@ -955,12 +955,12 @@ pub(super) fn decompress(compressed: &[u8], raw: &mut [u16]) -> Result<(), Code>
     let i_max = read_uint(4);
     let n_bits = read_uint(12);
     if im as usize >= HUF_ENCSIZE || i_max as usize >= HUF_ENCSIZE {
-        return Err(CORRUPT_CHUNK);
+        return Err(Error::CorruptChunk);
     }
     let mut ptr = 20usize;
     let n_bytes = u64::from(n_bits).div_ceil(8);
     if huf_info_block_size + n_bytes > n_compressed {
-        return Err(OUT_OF_MEMORY);
+        return Err(Error::OutOfMemory);
     }
 
     if n_bits > 128 {
@@ -973,7 +973,7 @@ pub(super) fn decompress(compressed: &[u8], raw: &mut [u16]) -> Result<(), Code>
             i_max as i32,
         )?;
         if ptr as u64 + n_bytes > n_compressed {
-            return Err(OUT_OF_MEMORY);
+            return Err(Error::OutOfMemory);
         }
         fhd.decode(compressed, ptr, u64::from(n_bits), raw)
     } else {
@@ -983,7 +983,7 @@ pub(super) fn decompress(compressed: &[u8], raw: &mut [u16]) -> Result<(), Code>
         // (Its answer is not looked at.)
         let _ = unpack_enc_table(compressed, &mut ptr, &mut n_left, im, i_max, &mut freq);
         if u64::from(n_bits) > 8 * n_left {
-            return Err(CORRUPT_CHUNK);
+            return Err(Error::CorruptChunk);
         }
         build_dec_table(&freq, im, i_max, &mut hdec)?;
         decode(&freq, &hdec, compressed, ptr, u64::from(n_bits), i_max, raw)

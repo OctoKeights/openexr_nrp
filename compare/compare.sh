@@ -6,8 +6,8 @@
 #
 # compare/dump_dwa.c is built against the OpenEXRCore of a CMake build of OpenEXR (with Imath as
 # that build fetches it; only OpenEXRCore need be built), and examples/dump.rs from the port; both
-# run the same made-up data for each seed and what they print is compared byte for byte. Dumps:
-# dwa_write, with a hundredth of [count] (200,000 by default) as the number of made-up blocks,
+# run the same synthetic data for each seed and what they print is compared byte for byte. Dumps:
+# dwa_write, with a hundredth of [count] (200,000 by default) as the number of synthetic blocks,
 # each written by OpenEXRCore as the one block of a file, of lines or of a tile, compressed with
 # DWAA or DWAB and decompressed; and dwa_read, with as many, each then damaged and
 # decompressed. OpenEXRCore picks its code by what the machine has: the port is of its code for

@@ -1,5 +1,6 @@
-//! Made-up data, the same from a seed here as in the C side of the comparison
-//! (`compare/`), and the dumps the tests run as well as the comparison (`examples/dump.rs`).
+//! Synthetic data, generated from a seed exactly as the C side of the comparison
+//! (`compare/dump_dwa.c`) generates it, and the dumps that both the golden tests and
+//! `examples/dump.rs` run.
 
 // (The arithmetic is written as the C side has it; not every user of this module uses all of
 // it.)
@@ -47,11 +48,12 @@ impl Hash {
     }
 }
 
-/// The `dwa_write` and `dwa_read` dumps of `compare/dump_dwa.c`: made-up blocks of an image
+/// The `dwa_write` and `dwa_read` dumps of `compare/dump_dwa.c`: synthetic blocks of an image
 /// compressed as DWAA or DWAB and back (`dwa_write`), or compressed, damaged and decompressed
 /// (`dwa_read`).
 pub fn dwa(what: &str, seed: u64, count: u32) -> String {
-    use openexr_nrp::dwa::{Channel, compress, uncompress};
+    use openexr_nrp::PixelType;
+    use openexr_nrp::dwa::{AcCompression, Channel, compress, decompress};
     const NAMES: [&str; 24] = [
         "R",
         "G",
@@ -235,8 +237,8 @@ pub fn dwa(what: &str, seed: u64, count: u32) -> String {
         let channels: Vec<Channel> = (0..n)
             .map(|c| Channel {
                 name: NAMES[names[c]],
-                pixel_type: types[c],
-                p_linear: linear[c],
+                pixel_type: PixelType::from_code(types[c]).unwrap(),
+                linear: linear[c],
             })
             .collect();
 
@@ -255,21 +257,27 @@ pub fn dwa(what: &str, seed: u64, count: u32) -> String {
             width,
             lines,
             level,
-            compression == 8 && tiled,
-        );
+            // (OpenEXR's choice: zlib for the tiles of DWAA, Huffman coding for the rest.)
+            if compression == 8 && tiled {
+                AcCompression::Deflate
+            } else {
+                AcCompression::Huffman
+            },
+        )
+        .expect("a block of the channels' size");
         raw_total += raw.len() as u64;
         block_total += block.len() as u64;
         stored += u64::from(block.len() == raw.len());
         let mut decode = |hash: &mut Hash, data: &[u8]| {
             let mut lines_out = vec![0u8; raw.len()];
-            let code = match uncompress(data, &channels, width, lines, &mut lines_out) {
+            let code = match decompress(data, &channels, width, lines, &mut lines_out) {
                 Ok(()) => {
                     decompressed += 1;
                     0
                 }
-                Err(code) => {
+                Err(error) => {
                     refused += 1;
-                    code
+                    error.code()
                 }
             };
             hash.add(&(code as u32).to_le_bytes());

@@ -13,29 +13,39 @@ fn quiet(x: f32) -> f32 {
 /// The NaN x86 gives for an invalid operation (infinity less infinity, zero times infinity).
 const DEFAULT_NAN: u32 = 0xffc0_0000;
 
+/// `r`, the result of an operation on `a` and `b`, or the NaN x86 gives in its place.
+#[inline(always)]
 fn nan_or(a: f32, b: f32, r: f32) -> f32 {
+    // (A NaN operand always makes a NaN result, so the result alone says whether to look.)
+    if r.is_nan() { x86_nan(a, b) } else { r }
+}
+
+/// The NaN x86 gives for an operation on `a` and `b` whose result is NaN.
+#[cold]
+fn x86_nan(a: f32, b: f32) -> f32 {
     if a.is_nan() {
         quiet(a)
     } else if b.is_nan() {
         quiet(b)
-    } else if r.is_nan() {
-        f32::from_bits(DEFAULT_NAN)
     } else {
-        r
+        f32::from_bits(DEFAULT_NAN)
     }
 }
 
-/// `addps`/`addss`, `a` its first source.
+/// `addps/`addss`, `a` its first source.
+#[inline(always)]
 pub(super) fn add(a: f32, b: f32) -> f32 {
     nan_or(a, b, a + b)
 }
 
-/// `subps`/`subss`.
+/// `subps/`subss`.
+#[inline(always)]
 pub(super) fn sub(a: f32, b: f32) -> f32 {
     nan_or(a, b, a - b)
 }
 
-/// `mulps`/`mulss`, `a` its first source.
+/// `mulps/`mulss`, `a` its first source.
+#[inline(always)]
 pub(super) fn mul(a: f32, b: f32) -> f32 {
     nan_or(a, b, a * b)
 }
@@ -44,12 +54,29 @@ pub(super) fn mul(a: f32, b: f32) -> f32 {
 // Halves.
 
 /// `half_to_float` of OpenEXRCore (Imath's): exact, a NaN keeping its bits.
+#[inline]
 pub(super) fn half_to_float(h: u16) -> f32 {
-    let h = u32::from(h);
+    HALF_TO_FLOAT[usize::from(h)]
+}
+
+/// Every half as a float, worked out when the crate is compiled.
+static HALF_TO_FLOAT: [f32; 65536] = {
+    let mut table = [0.0; 65536];
+    let mut h = 0;
+    while h < 65536 {
+        table[h] = f32::from_bits(half_to_float_bits(h as u16));
+        h += 1;
+    }
+    table
+};
+
+/// The bits of the float a half is.
+const fn half_to_float_bits(h: u16) -> u32 {
+    let h = h as u32;
     let sign = (h >> 15) << 31;
     let exp = (h >> 10) & 0x1f;
     let mant = h & 0x3ff;
-    let bits = if exp == 0x1f {
+    if exp == 0x1f {
         sign | 0x7f80_0000 | (mant << 13)
     } else if exp != 0 {
         sign | ((exp + 112) << 23) | (mant << 13)
@@ -60,8 +87,7 @@ pub(super) fn half_to_float(h: u16) -> f32 {
         sign | ((113 - shift) << 23) | (((mant << shift) & 0x3ff) << 13)
     } else {
         sign
-    };
-    f32::from_bits(bits)
+    }
 }
 
 /// `float_to_half` of OpenEXRCore (Imath's bit shifting): rounded to nearest, ties to even, a
@@ -169,7 +195,8 @@ pub(super) fn csc709_inverse(data: &mut [[f32; 64]], idx: [usize; 3]) {
 }
 
 /// `csc709Inverse64`, the SSE2 one. (The three blocks may be one block, which a file's
-/// rules for its channels can have; each step reads it as it then is.)
+/// rules for its channels can have; each step reads it as it then is, hence the indexing.)
+#[allow(clippy::needless_range_loop)]
 pub(super) fn csc709_inverse64(data: &mut [[f32; 64]], idx: [usize; 3]) {
     let (c0, c1, c2, c3) = (1.5747f32, 1.8556f32, -0.1873f32, -0.4682f32);
     let [r, g, b] = idx;
@@ -190,6 +217,7 @@ pub(super) fn csc709_inverse64(data: &mut [[f32; 64]], idx: [usize; 3]) {
 }
 
 /// `csc709Forward64`: R'G'B' to Y'CbCr.
+#[allow(clippy::needless_range_loop)]
 pub(super) fn csc709_forward64(data: &mut [[f32; 64]], idx: [usize; 3]) {
     for i in 0..64 {
         let src0 = data[idx[0]][i];

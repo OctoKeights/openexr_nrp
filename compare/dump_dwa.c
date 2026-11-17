@@ -6,9 +6,9 @@
    examples/dump.rs prints the same from the Rust port, and compare/compare.sh compares the
    two.
 
-     dump dwa_write <seed> <count>   made-up blocks of one to six channels (of halves, floats
+     dump dwa_write <seed> <count>   synthetic blocks of one to six channels (of halves, floats
                                      and integers, named as DWA's rules have them and not)
-                                     compressed as DWAA or DWAB at a made-up level, and back
+                                     compressed as DWAA or DWAB at a synthetic level, and back
      dump dwa_read <seed> <count>    those blocks, compressed, damaged in one of eleven ways,
                                      decompressed
 
@@ -95,7 +95,7 @@ static int CompareNames (const void* a, const void* b)
     return strcmp (kNames[*(const int*) a], kNames[*(const int*) b]);
 }
 
-/* A made-up value of a channel at (x, y), of one of eight kinds. */
+/* A synthetic value of a channel at (x, y), of one of eight kinds. */
 typedef struct
 {
     int      kind;
@@ -422,7 +422,7 @@ static size_t Damage (uint8_t* data, size_t size, size_t room)
 {
     switch (Next () % 11)
     {
-        case 10: /* made-up rules for the channels in place of its own */
+        case 10: /* synthetic rules for the channels in place of its own */
             if (size >= 90 && GetCounter (data, 0) == 2)
             {
                 size_t   old  = (size_t) data[88] | ((size_t) data[89] << 8);
@@ -488,7 +488,7 @@ static size_t Damage (uint8_t* data, size_t size, size_t room)
                 data[size++] = (uint8_t) Next ();
             return size;
         }
-        case 6: { /* made-up counters and bytes */
+        case 6: { /* synthetic counters and bytes */
             size_t n = 88 + Next () % 300;
             if (n > room) n = room;
             for (size_t k = 0; k < n; ++k)

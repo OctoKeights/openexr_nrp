@@ -1,10 +1,10 @@
-//! The Rust half of the comparison with OpenEXRCore: runs the port over made-up data and
+//! The Rust half of the comparison with OpenEXRCore: runs the port over synthetic data and
 //! prints a running hash of what comes out, as `compare/dump_dwa.c` does with the original.
 //! `compare/compare.sh` compares the two.
 //!
-//!   dump dwa_write <seed> <count>   made-up blocks of one to six channels (of halves, floats
+//!   dump dwa_write <seed> <count>   synthetic blocks of one to six channels (of halves, floats
 //!                                   and integers, named as DWA's rules have them and not)
-//!                                   compressed as DWAA or DWAB at a made-up level, and back
+//!                                   compressed as DWAA or DWAB at a synthetic level, and back
 //!   dump dwa_read <seed> <count>    those blocks, compressed, damaged in one of eleven ways,
 //!                                   decompressed
 
