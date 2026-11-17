@@ -11,4 +11,4 @@ keywords = ["openexr", "exr", "dwaa", "dwab", "compression"]
 categories = ["compression", "multimedia::images"]
 
 [dependencies]
-libdeflate_nrp = { version = "0.1.0", git = "https://github.com/OctoKeights/libdeflate_nrp" }
+libdeflate_nrp = { version = "0.2.0", git = "https://github.com/OctoKeights/libdeflate_nrp" }

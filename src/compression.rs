@@ -35,7 +35,12 @@ pub fn compress_max_buffer_size(in_bytes: usize) -> usize {
 ///
 /// For level 1 or a level above 9, which [`libdeflate_nrp`] does not port.
 pub fn compress_buffer(level: i32, input: &[u8]) -> Vec<u8> {
-    libdeflate_nrp::zlib_compress(if level < 0 { 4 } else { level }, input)
+    let level = if level < 0 { 4 } else { level };
+    let level = u8::try_from(level)
+        .ok()
+        .and_then(libdeflate_nrp::Level::new)
+        .unwrap_or_else(|| panic!("libdeflate level {level} is not ported"));
+    libdeflate_nrp::zlib_compress(input, level)
 }
 
 /// `exr_uncompress_buffer`: the zlib stream `input` into the start of `out`, the bytes made,
@@ -43,7 +48,7 @@ pub fn compress_buffer(level: i32, input: &[u8]) -> Vec<u8> {
 /// not end where `input` does, [`OUT_OF_MEMORY`] for one that makes more than `out` takes.
 pub fn uncompress_buffer(input: &[u8], out: &mut [u8]) -> Result<usize, Code> {
     match libdeflate_nrp::zlib_decompress(input, out) {
-        Ok((actual_in, actual_out)) if actual_in == input.len() => Ok(actual_out),
+        Ok(result) if result.bytes_read == input.len() => Ok(result.bytes_written),
         Ok(_) | Err(libdeflate_nrp::Error::BadData) => Err(CORRUPT_CHUNK),
         Err(libdeflate_nrp::Error::InsufficientSpace) => Err(OUT_OF_MEMORY),
     }
