@@ -1,0 +1,14 @@
+[package]
+name = "openexr_nrp"
+description = "OpenEXR's DWAA and DWAB compressions in pure, safe Rust: a native port of OpenEXRCore's, giving the blocks OpenEXRCore gives on x86-64."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "BSD-3-Clause"
+repository = "https://github.com/OctoKeights/openexr_nrp"
+readme = "README.md"
+keywords = ["openexr", "exr", "dwaa", "dwab", "compression"]
+categories = ["compression", "multimedia::images"]
+
+[dependencies]
+libdeflate_nrp = { version = "0.1.0", git = "https://github.com/OctoKeights/libdeflate_nrp" }
