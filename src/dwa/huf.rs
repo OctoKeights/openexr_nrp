@@ -31,7 +31,7 @@ fn canonical_code_table(hcode: &mut [u64]) {
     }
     let mut c = 0u64;
     for i in (1..=58).rev() {
-        let nc = (c + n[i]) >> 1;
+        let nc = c.midpoint(n[i]);
         n[i] = c;
         c = nc;
     }
