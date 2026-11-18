@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.1
+
+- **Stricter lints, enforced in CI.** `Cargo.toml` turns on clippy's pedantic group for every
+  target, and forbids `unsafe` code in the tests, examples and benchmarks as well as the
+  library. Functions that return a `Result` document their errors.
+
+- **Idiomatic internals.** The DWA block's eleven counters are a `Counters` struct that reads,
+  writes and checks itself, in place of indexes into an array; the parts of a compressed
+  block, the layout of its lines and the encoder's state are structs of their own. The
+  Huffman decoders keep their position in `HufReader`, `BitCursor` and `FastBits` in place of
+  long lists of arguments, and nothing in the library calls `expect`.
+
+- Output is unchanged, checked against OpenEXRCore on 400,000 blocks written and 400,000
+  damaged blocks read, and the codec runs 0.26% fewer instructions.
+
 ## 0.2.0
 
 - **Breaking: an idiomatic API.** A channel's type is a `PixelType` (`Uint`, `Half`,

@@ -32,6 +32,7 @@ pub enum PixelType {
 
 impl PixelType {
     /// The pixel type a file records as `code`: 0, 1 or 2.
+    #[must_use]
     pub const fn from_code(code: i32) -> Option<PixelType> {
         match code {
             0 => Some(PixelType::Uint),
@@ -42,11 +43,13 @@ impl PixelType {
     }
 
     /// The number a file records for the pixel type.
+    #[must_use]
     pub const fn code(self) -> i32 {
         self as i32
     }
 
     /// The bytes of one value.
+    #[must_use]
     pub const fn bytes(self) -> usize {
         match self {
             PixelType::Half => 2,
@@ -73,7 +76,8 @@ pub enum Error {
 }
 
 impl Error {
-    /// OpenEXRCore's number for the error.
+    /// `OpenEXRCore`'s number for the error.
+    #[must_use]
     pub const fn code(self) -> i32 {
         match self {
             Error::OutOfMemory => 1,

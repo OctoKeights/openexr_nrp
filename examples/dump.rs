@@ -2,10 +2,10 @@
 //! prints a running hash of what comes out, as `compare/dump_dwa.c` does with the original.
 //! `compare/compare.sh` compares the two.
 //!
-//!   dump dwa_write <seed> <count>   synthetic blocks of one to six channels (of halves, floats
+//!   dump `dwa_write` <seed> <count>   synthetic blocks of one to six channels (of halves, floats
 //!                                   and integers, named as DWA's rules have them and not)
 //!                                   compressed as DWAA or DWAB at a synthetic level, and back
-//!   dump dwa_read <seed> <count>    those blocks, compressed, damaged in one of eleven ways,
+//!   dump `dwa_read` <seed> <count>    those blocks, compressed, damaged in one of eleven ways,
 //!                                   decompressed
 
 #[path = "../tests/made_up/mod.rs"]

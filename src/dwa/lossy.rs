@@ -8,6 +8,7 @@ use super::simd::{
 };
 use super::{to_linear, to_nonlinear};
 use crate::{Error, PixelType};
+use core::cmp::Ordering;
 
 // ---------------------------------------------------------------------------------------
 // Quantization.
@@ -219,34 +220,38 @@ fn handle_quantize_larger_or_smaller_sig(
     let bits0 = count_set_bits(alt0);
     let bits1 = count_set_bits(alt1);
 
-    if bits1 < bits0 {
-        let delta = half_to_float(alt1 as u16) - src_float; // alt1 >= srcFloat
-        if delta < err_tol {
-            return alt1;
-        }
-        let delta = src_float - half_to_float(alt0 as u16); // alt0 <= srcFloat
-        if delta < err_tol {
-            return alt0;
-        }
-    } else if bits1 == bits0 {
-        let delta = src_float - half_to_float(alt0 as u16);
-        let delta1 = half_to_float(alt1 as u16) - src_float;
-        if delta < err_tol {
-            return if delta1 < delta { alt1 } else { alt0 };
-        }
-        if delta1 < err_tol {
-            return alt1;
-        }
-    } else {
-        let delta = src_float - half_to_float(alt0 as u16);
-        if delta < err_tol {
-            return alt0;
-        }
-        let srcbits = count_set_bits(abssrc);
-        if bits1 < srcbits {
-            let delta = half_to_float(alt1 as u16) - src_float;
+    // Of the two alternates, the one with fewer bits set is preferred.
+    match bits1.cmp(&bits0) {
+        Ordering::Less => {
+            let delta = half_to_float(alt1 as u16) - src_float; // alt1 >= srcFloat
             if delta < err_tol {
                 return alt1;
+            }
+            let delta = src_float - half_to_float(alt0 as u16); // alt0 <= srcFloat
+            if delta < err_tol {
+                return alt0;
+            }
+        }
+        Ordering::Equal => {
+            let delta = src_float - half_to_float(alt0 as u16);
+            let delta1 = half_to_float(alt1 as u16) - src_float;
+            if delta < err_tol {
+                return if delta1 < delta { alt1 } else { alt0 };
+            }
+            if delta1 < err_tol {
+                return alt1;
+            }
+        }
+        Ordering::Greater => {
+            let delta = src_float - half_to_float(alt0 as u16);
+            if delta < err_tol {
+                return alt0;
+            }
+            if bits1 < count_set_bits(abssrc) {
+                let delta = half_to_float(alt1 as u16) - src_float;
+                if delta < err_tol {
+                    return alt1;
+                }
             }
         }
     }
@@ -436,6 +441,8 @@ pub(super) struct Coefficients {
 /// `LossyDctEncoder_execute`: one channel, or three (red, green and blue, converted to
 /// Y'CbCr), of `raw` coded, their coefficients added to `out`. `nonlinear` is whether the
 /// values go through `toNonlinear` first.
+// (One pass over the blocks, step for step as OpenEXRCore's.)
+#[allow(clippy::too_many_lines)]
 pub(super) fn encode(
     raw: &[u8],
     sources: &[Source],
@@ -661,6 +668,8 @@ impl Decoder {
         result
     }
 
+    // (One pass over the blocks, step for step as OpenEXRCore's.)
+    #[allow(clippy::too_many_lines)]
     fn decode_into(
         &mut self,
         out: &mut [u8],
@@ -740,20 +749,20 @@ impl Decoder {
 
                 if num_comp == 3 {
                     let idx = [targets[0].channel, targets[1].channel, targets[2].channel];
-                    if !block_is_constant {
-                        csc709_inverse64(&mut self.dct, idx);
-                    } else {
+                    if block_is_constant {
                         csc709_inverse(&mut self.dct, idx);
+                    } else {
+                        csc709_inverse64(&mut self.dct, idx);
                     }
                 }
 
                 for (comp, target) in targets.iter().enumerate() {
                     let dst = &mut row_block
                         [comp * block_row + blockx * 64..comp * block_row + blockx * 64 + 64];
-                    if !block_is_constant {
-                        convert_float_to_half64(dst, &self.dct[target.channel]);
-                    } else {
+                    if block_is_constant {
                         dst.fill(float_to_half(self.dct[target.channel][0]));
+                    } else {
+                        convert_float_to_half64(dst, &self.dct[target.channel]);
                     }
                 }
             }

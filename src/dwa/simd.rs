@@ -14,7 +14,7 @@ fn quiet(x: f32) -> f32 {
 const DEFAULT_NAN: u32 = 0xffc0_0000;
 
 /// `r`, the result of an operation on `a` and `b`, or the NaN x86 gives in its place.
-#[inline(always)]
+#[inline]
 fn nan_or(a: f32, b: f32, r: f32) -> f32 {
     // (A NaN operand always makes a NaN result, so the result alone says whether to look.)
     if r.is_nan() { x86_nan(a, b) } else { r }
@@ -32,20 +32,20 @@ fn x86_nan(a: f32, b: f32) -> f32 {
     }
 }
 
-/// `addps/`addss`, `a` its first source.
-#[inline(always)]
+/// `addps`/`addss`, `a` its first source.
+#[inline]
 pub(super) fn add(a: f32, b: f32) -> f32 {
     nan_or(a, b, a + b)
 }
 
-/// `subps/`subss`.
-#[inline(always)]
+/// `subps`/`subss`.
+#[inline]
 pub(super) fn sub(a: f32, b: f32) -> f32 {
     nan_or(a, b, a - b)
 }
 
-/// `mulps/`mulss`, `a` its first source.
-#[inline(always)]
+/// `mulps`/`mulss`, `a` its first source.
+#[inline]
 pub(super) fn mul(a: f32, b: f32) -> f32 {
     nan_or(a, b, a * b)
 }
@@ -82,7 +82,7 @@ const fn half_to_float_bits(h: u16) -> u32 {
         sign | ((exp + 112) << 23) | (mant << 13)
     } else if mant != 0 {
         // A denormal: shift the mantissa up to its leading one.
-        let lead = 31 - mant.leading_zeros(); // 0..=9
+        let lead = mant.ilog2(); // 0..=9
         let shift = 10 - lead;
         sign | ((113 - shift) << 23) | (((mant << shift) & 0x3ff) << 13)
     } else {
@@ -197,6 +197,7 @@ pub(super) fn csc709_inverse(data: &mut [[f32; 64]], idx: [usize; 3]) {
 /// `csc709Inverse64`, the SSE2 one. (The three blocks may be one block, which a file's
 /// rules for its channels can have; each step reads it as it then is, hence the indexing.)
 #[allow(clippy::needless_range_loop)]
+#[inline]
 pub(super) fn csc709_inverse64(data: &mut [[f32; 64]], idx: [usize; 3]) {
     let (c0, c1, c2, c3) = (1.5747f32, 1.8556f32, -0.1873f32, -0.4682f32);
     let [r, g, b] = idx;
@@ -216,7 +217,7 @@ pub(super) fn csc709_inverse64(data: &mut [[f32; 64]], idx: [usize; 3]) {
     }
 }
 
-/// `csc709Forward64`: R'G'B' to Y'CbCr.
+/// `csc709Forward64`: R'G'B' to Y'CbCr. (As for the inverse, the three blocks may be one.)
 #[allow(clippy::needless_range_loop)]
 pub(super) fn csc709_forward64(data: &mut [[f32; 64]], idx: [usize; 3]) {
     for i in 0..64 {
@@ -256,13 +257,13 @@ pub(super) fn convert_float_to_half64(dst: &mut [u16], src: &[f32; 64]) {
 // ---------------------------------------------------------------------------------------
 // The inverse DCT.
 
-const A: f32 = 3.535536e-01;
-const C: f32 = 4.619398e-01;
-const F: f32 = 1.913422e-01;
-const B: f32 = 4.903927e-01;
-const D: f32 = 4.157349e-01;
-const E: f32 = 2.777855e-01;
-const G: f32 = 9.754573e-02;
+const A: f32 = 3.535_536e-01;
+const C: f32 = 4.619_398e-01;
+const F: f32 = 1.913_422e-01;
+const B: f32 = 4.903_927e-01;
+const D: f32 = 4.157_349e-01;
+const E: f32 = 2.777_855e-01;
+const G: f32 = 9.754_573e-02;
 
 /// The columns of M1 and of M2 (`sAvxCoef`).
 const M1: [[f32; 4]; 4] = [[A, A, A, A], [C, F, -F, -C], [A, -A, -A, A], [F, -C, C, -F]];
@@ -270,7 +271,7 @@ const M2: [[f32; 4]; 4] = [[B, D, E, G], [D, -G, -B, -E], [E, -B, G, D], [G, -E,
 
 /// `dctInverse8x8DcOnly`.
 pub(super) fn dct_inverse8x8_dc_only(data: &mut [f32; 64]) {
-    let val = mul(mul(data[0], 3.535536e-01), 3.535536e-01);
+    let val = mul(mul(data[0], 3.535_536e-01), 3.535_536e-01);
     data.fill(val);
 }
 
@@ -294,6 +295,9 @@ fn idct_row(row: &[f32]) -> [f32; 8] {
 
 /// `dctInverse8x8_avx_<zeroed_rows>`: the last `zeroed_rows` rows of the block are taken to
 /// be zero (and are left out of the sums), from 0 to 7.
+// (The names are those of the published transform, as OpenEXRCore has them.)
+#[allow(clippy::many_single_char_names)]
+#[inline]
 pub(super) fn dct_inverse8x8(data: &mut [f32; 64], zeroed_rows: usize) {
     if zeroed_rows == 7 {
         let row = idct_row(&data[0..8]);
@@ -412,14 +416,14 @@ pub(super) fn dct_inverse8x8(data: &mut [f32; 64], zeroed_rows: usize) {
 /// the original's.)
 #[allow(clippy::approx_constant, clippy::excessive_precision)]
 fn fdct_column(s: [f32; 8]) -> [f32; 8] {
-    let c4 = 0.70710678f32;
-    let c4_neg = -0.70710678f32;
-    let c1_half = 0.490392640f32;
-    let c2_half = 0.461939770f32;
-    let c3_half = 0.415734810f32;
-    let c5_half = 0.277785120f32;
-    let c6_half = 0.191341720f32;
-    let c7_half = 0.097545161f32;
+    let c4 = 0.707_106_78_f32;
+    let c4_neg = -0.707_106_78_f32;
+    let c1_half = 0.490_392_640_f32;
+    let c2_half = 0.461_939_770_f32;
+    let c3_half = 0.415_734_810_f32;
+    let c5_half = 0.277_785_120_f32;
+    let c6_half = 0.191_341_720_f32;
+    let c7_half = 0.097_545_161_f32;
     let half = 0.5f32;
 
     let a0 = add(s[0], s[7]);
@@ -459,6 +463,7 @@ fn fdct_column(s: [f32; 8]) -> [f32; 8] {
 
 /// `dctForward8x8`, the SSE2 one: down the columns, then (after a transpose) down them
 /// again, and transposed back.
+#[inline]
 pub(super) fn dct_forward8x8(data: &mut [f32; 64]) {
     for _ in 0..2 {
         let mut t = [0f32; 64];
@@ -482,39 +487,41 @@ mod tests {
     fn halves_are_converted_as_openexrcore_converts_them() {
         // FNV-1a of every half as a float, and of a sweep of floats as halves, from a
         // build of OpenEXRCore (and of the F16C instructions).
-        let mut hash = 14695981039346656037u64;
+        let mut hash = 14_695_981_039_346_656_037_u64;
         let mut fnv = |bytes: &[u8]| {
             for &b in bytes {
                 hash ^= u64::from(b);
-                hash = hash.wrapping_mul(1099511628211);
+                hash = hash.wrapping_mul(1_099_511_628_211);
             }
         };
         for h in 0..=u16::MAX {
             fnv(&half_to_float(h).to_bits().to_le_bytes());
         }
-        assert_eq!(hash, 0xb0659868ec053145);
-        let mut hash = 14695981039346656037u64;
+        assert_eq!(hash, 0xb065_9868_ec05_3145);
+        let mut hash = 14_695_981_039_346_656_037_u64;
         let mut fnv = |bytes: &[u8]| {
             for &b in bytes {
                 hash ^= u64::from(b);
-                hash = hash.wrapping_mul(1099511628211);
+                hash = hash.wrapping_mul(1_099_511_628_211);
             }
         };
         for h in 0..=u16::MAX {
             fnv(&f16c_to_float(h).to_bits().to_le_bytes());
         }
-        assert_eq!(hash, 0x5d79f1b086f30345);
+        assert_eq!(hash, 0x5d79_f1b0_86f3_0345);
     }
 
-    // Every float: slow but for an optimised build.
     #[test]
-    #[ignore]
+    #[ignore = "every float: slow but for an optimised build (cargo test --release -- --ignored)"]
     fn every_float_is_converted_as_openexrcore_and_f16c_convert_it() {
-        let (mut ours, mut f16c) = (14695981039346656037u64, 14695981039346656037u64);
+        let (mut ours, mut f16c) = (
+            14_695_981_039_346_656_037_u64,
+            14_695_981_039_346_656_037_u64,
+        );
         let fnv = |hash: &mut u64, bytes: [u8; 2]| {
             for b in bytes {
                 *hash ^= u64::from(b);
-                *hash = hash.wrapping_mul(1099511628211);
+                *hash = hash.wrapping_mul(1_099_511_628_211);
             }
         };
         for bits in 0..=u32::MAX {
@@ -522,6 +529,6 @@ mod tests {
             fnv(&mut ours, float_to_half(f).to_le_bytes());
             fnv(&mut f16c, f16c_to_half(f).to_le_bytes());
         }
-        assert_eq!((ours, f16c), (0x94a80fad4f52a325, 0xe063384da55e2325));
+        assert_eq!((ours, f16c), (0x94a8_0fad_4f52_a325, 0xe063_384d_a55e_2325));
     }
 }

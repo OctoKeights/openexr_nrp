@@ -350,7 +350,9 @@ fn unpack_enc_table(
     let mut c = 0u64;
     let ni = *n_left;
     let mut lc = 0u32;
-    hcode.iter_mut().for_each(|code| *code = 0);
+    for code in hcode.iter_mut() {
+        *code = 0;
+    }
     while im <= i_max {
         let nr = (p - start) as u64;
         if lc < 6 && nr >= ni {
@@ -435,45 +437,59 @@ fn build_dec_table(
     Ok(())
 }
 
-/// `getCode`: a symbol out, or a run of the one before.
-#[allow(clippy::too_many_arguments)]
-fn get_code(
-    po: u32,
+/// The state of the classic decoder (`hufDecode`): the bits not yet decoded, read from the
+/// most significant end, and the symbols written so far.
+struct HufReader<'a> {
+    input: &'a [u8],
+    /// The next byte to read, and the end of the input's bytes.
+    at: usize,
+    end: usize,
+    /// `count` bits held in the low end of `bits` (`c` and `lc`).
+    bits: u64,
+    count: i32,
+    out: &'a mut [u16],
+    /// The symbols written (`o`).
+    written: usize,
+    /// The symbol that marks a run of the one before.
     rlc: u32,
-    c: &mut u64,
-    lc: &mut i32,
-    input: &[u8],
-    at: &mut usize,
-    ie: usize,
-    out: &mut [u16],
-    o: &mut usize,
-) -> Result<(), Error> {
-    if po == rlc {
-        if *lc < 8 {
-            if *at >= ie {
+}
+
+impl HufReader<'_> {
+    /// Reads a byte into the bits held.
+    fn refill(&mut self) {
+        self.bits = (self.bits << 8) | u64::from(self.input[self.at]);
+        self.at += 1;
+        self.count += 8;
+    }
+
+    /// `getCode`: symbol `po` out, or a run of the one before.
+    fn get_code(&mut self, po: u32) -> Result<(), Error> {
+        if po == self.rlc {
+            if self.count < 8 {
+                if self.at >= self.end {
+                    return Err(Error::OutOfMemory);
+                }
+                self.refill();
+            }
+            self.count -= 8;
+            let run = (self.bits >> self.count) as u8 as usize;
+            let o = self.written;
+            if o + run > self.out.len() {
+                return Err(Error::CorruptChunk);
+            } else if o == 0 {
                 return Err(Error::OutOfMemory);
             }
-            *c = (*c << 8) | u64::from(input[*at]);
-            *at += 1;
-            *lc += 8;
-        }
-        *lc -= 8;
-        let cs = (*c >> *lc) as u8 as usize;
-        if *o + cs > out.len() {
+            let previous = self.out[o - 1];
+            self.out[o..o + run].fill(previous);
+            self.written += run;
+        } else if self.written < self.out.len() {
+            self.out[self.written] = po as u16;
+            self.written += 1;
+        } else {
             return Err(Error::CorruptChunk);
-        } else if *o == 0 {
-            return Err(Error::OutOfMemory);
         }
-        let s = out[*o - 1];
-        out[*o..*o + cs].fill(s);
-        *o += cs;
-    } else if *o < out.len() {
-        out[*o] = po as u16;
-        *o += 1;
-    } else {
-        return Err(Error::CorruptChunk);
+        Ok(())
     }
-    Ok(())
 }
 
 /// `hufDecode`.
@@ -486,27 +502,29 @@ fn decode(
     rlc: u32,
     out: &mut [u16],
 ) -> Result<(), Error> {
-    let mut c = 0u64;
-    let mut lc = 0i32;
-    let mut o = 0usize;
-    let mut at = start;
-    let ie = start + ni.div_ceil(8) as usize;
+    let mut r = HufReader {
+        input,
+        at: start,
+        end: start + ni.div_ceil(8) as usize,
+        bits: 0,
+        count: 0,
+        out,
+        written: 0,
+        rlc,
+    };
+    let decbits = HUF_DECBITS as i32;
 
-    while at < ie {
-        c = (c << 8) | u64::from(input[at]);
-        at += 1;
-        lc += 8;
-        while lc >= HUF_DECBITS as i32 {
-            let decoffset = (c >> (lc - HUF_DECBITS as i32)) & HUF_DECMASK;
+    while r.at < r.end {
+        r.refill();
+        while r.count >= decbits {
+            let decoffset = (r.bits >> (r.count - decbits)) & HUF_DECMASK;
             let pl = &hdecod[decoffset as usize];
             if pl.len != 0 {
-                if pl.len as i32 > lc {
+                if (pl.len as i32) > r.count {
                     return Err(Error::CorruptChunk);
                 }
-                lc -= pl.len as i32;
-                get_code(
-                    pl.lit, rlc, &mut c, &mut lc, input, &mut at, ie, out, &mut o,
-                )?;
+                r.count -= pl.len as i32;
+                r.get_code(pl.lit)?;
             } else {
                 let Some(decbuf) = &pl.p else {
                     return Err(Error::CorruptChunk);
@@ -514,16 +532,15 @@ fn decode(
                 let mut found = false;
                 for &sym in decbuf.iter().take(pl.lit as usize) {
                     let l = huf_length(hcode[sym as usize]) as i32;
-                    while lc < l && at < ie {
-                        c = (c << 8) | u64::from(input[at]);
-                        at += 1;
-                        lc += 8;
+                    while r.count < l && r.at < r.end {
+                        r.refill();
                     }
-                    if lc >= l
-                        && huf_code(hcode[sym as usize]) == ((c >> (lc - l)) & ((1u64 << l) - 1))
+                    if r.count >= l
+                        && huf_code(hcode[sym as usize])
+                            == ((r.bits >> (r.count - l)) & ((1u64 << l) - 1))
                     {
-                        lc -= l;
-                        get_code(sym, rlc, &mut c, &mut lc, input, &mut at, ie, out, &mut o)?;
+                        r.count -= l;
+                        r.get_code(sym)?;
                         found = true;
                         break;
                     }
@@ -537,24 +554,18 @@ fn decode(
 
     // Get remaining (short) codes
     let i = (8u64.wrapping_sub(ni)) & 7;
-    c >>= i;
-    lc -= i as i32;
-    while lc > 0 {
-        let decoffset = (c << (HUF_DECBITS as i32 - lc)) & HUF_DECMASK;
+    r.bits >>= i;
+    r.count -= i as i32;
+    while r.count > 0 {
+        let decoffset = (r.bits << (decbits - r.count)) & HUF_DECMASK;
         let pl = &hdecod[decoffset as usize];
-        if pl.len != 0 {
-            if pl.len as i32 > lc {
-                return Err(Error::CorruptChunk);
-            }
-            lc -= pl.len as i32;
-            get_code(
-                pl.lit, rlc, &mut c, &mut lc, input, &mut at, ie, out, &mut o,
-            )?;
-        } else {
+        if pl.len == 0 || (pl.len as i32) > r.count {
             return Err(Error::CorruptChunk);
         }
+        r.count -= pl.len as i32;
+        r.get_code(pl.lit)?;
     }
-    if o != out.len() {
+    if r.written != r.out.len() {
         return Err(Error::OutOfMemory);
     }
     Ok(())
@@ -582,24 +593,41 @@ struct FastHufDecoder {
 }
 
 fn read64(input: &[u8], at: usize) -> u64 {
-    u64::from_be_bytes(input[at..at + 8].try_into().expect("eight bytes"))
+    let mut bytes = [0; 8];
+    bytes.copy_from_slice(&input[at..at + 8]);
+    u64::from_be_bytes(bytes)
 }
 
-/// `fasthuf_read_bits`.
-fn fast_read_bits(
-    num_bits: u32,
-    buffer: &mut u64,
-    buffer_num_bits: &mut u32,
-    input: &[u8],
-    at: &mut usize,
-) -> u64 {
-    while *buffer_num_bits < num_bits {
-        *buffer = (*buffer << 8) | u64::from(input[*at]);
-        *at += 1;
-        *buffer_num_bits += 8;
+/// The bits of the fast decoder's code lengths, read from the most significant end
+/// (`fasthuf_read_bits`'s state).
+struct BitCursor<'a> {
+    input: &'a [u8],
+    at: usize,
+    /// `count` bits held in the low end of `buffer`.
+    buffer: u64,
+    count: u32,
+}
+
+impl<'a> BitCursor<'a> {
+    fn new(input: &'a [u8], at: usize) -> Self {
+        Self {
+            input,
+            at,
+            buffer: 0,
+            count: 0,
+        }
     }
-    *buffer_num_bits -= num_bits;
-    (*buffer >> *buffer_num_bits) & ((1u64 << num_bits) - 1)
+
+    /// `fasthuf_read_bits`: the next `n` bits.
+    fn read(&mut self, n: u32) -> u64 {
+        while self.count < n {
+            self.buffer = (self.buffer << 8) | u64::from(self.input[self.at]);
+            self.at += 1;
+            self.count += 8;
+        }
+        self.count -= n;
+        (self.buffer >> self.count) & ((1u64 << n) - 1)
+    }
 }
 
 impl FastHufDecoder {
@@ -630,13 +658,13 @@ impl FastHufDecoder {
             table_min: 0,
         };
 
-        let (mut curr, mut curr_bits, mut curr_bit_count) = (start, 0u64, 0u32);
+        let mut bits = BitCursor::new(input, start);
         let mut symbol = u64::from(min_symbol);
         while symbol <= u64::from(max_symbol) {
-            if curr as u64 >= top_byte {
+            if bits.at as u64 >= top_byte {
                 return Err(Error::CorruptChunk);
             }
-            let code_len = fast_read_bits(6, &mut curr_bits, &mut curr_bit_count, input, &mut curr);
+            let code_len = bits.read(6);
             if code_len < SHORT_ZEROCODE_RUN {
                 if code_len == 0 {
                     symbol += 1;
@@ -646,12 +674,10 @@ impl FastHufDecoder {
                 fhd.max_code_length = fhd.max_code_length.max(code_len as u8);
                 code_count[code_len as usize] += 1;
             } else if code_len == LONG_ZEROCODE_RUN {
-                if curr as u64 >= top_byte {
+                if bits.at as u64 >= top_byte {
                     return Err(Error::CorruptChunk);
                 }
-                symbol += fast_read_bits(8, &mut curr_bits, &mut curr_bit_count, input, &mut curr)
-                    + SHORTEST_LONG_RUN
-                    - 1;
+                symbol += bits.read(8) + SHORTEST_LONG_RUN - 1;
             } else {
                 symbol += code_len - SHORT_ZEROCODE_RUN + 1;
             }
@@ -695,14 +721,13 @@ impl FastHufDecoder {
 
         let mut mapping = [u64::MAX; MAX_CODE_LEN + 1];
         // (With no code at all, the lengths go from 255 down to 0, and nothing is copied.)
-        #[allow(clippy::manual_memcpy)]
-        for l in min_len..=max_len {
-            mapping[l] = offset[l];
+        if min_len <= max_len {
+            mapping[min_len..=max_len].copy_from_slice(&offset[min_len..=max_len]);
         }
-        let (mut curr, mut curr_bits, mut curr_bit_count) = (start, 0u64, 0u32);
+        let mut bits = BitCursor::new(input, start);
         let mut symbol = u64::from(min_symbol);
         while symbol <= u64::from(max_symbol) {
-            let code_len = fast_read_bits(6, &mut curr_bits, &mut curr_bit_count, input, &mut curr);
+            let code_len = bits.read(6);
             if code_len < SHORT_ZEROCODE_RUN {
                 if code_len == 0 {
                     symbol += 1;
@@ -714,15 +739,13 @@ impl FastHufDecoder {
                 fhd.id_to_symbol[mapping[code_len as usize] as usize] = symbol as u32;
                 mapping[code_len as usize] += 1;
             } else if code_len == LONG_ZEROCODE_RUN {
-                symbol += fast_read_bits(8, &mut curr_bits, &mut curr_bit_count, input, &mut curr)
-                    + SHORTEST_LONG_RUN
-                    - 1;
+                symbol += bits.read(8) + SHORTEST_LONG_RUN - 1;
             } else {
                 symbol += code_len - SHORT_ZEROCODE_RUN + 1;
             }
             symbol += 1;
         }
-        *at = curr;
+        *at = bits.at;
         fhd.build_tables(&base, &offset)?;
         Ok(fhd)
     }
@@ -734,10 +757,10 @@ impl FastHufDecoder {
         offset: &[u64; MAX_CODE_LEN + 1],
     ) -> Result<(), Error> {
         for (i, (lj_base, &base)) in self.lj_base.iter_mut().zip(base).enumerate() {
-            *lj_base = if base != u64::MAX {
-                base.wrapping_shl(64 - i as u32)
-            } else {
+            *lj_base = if base == u64::MAX {
                 u64::MAX
+            } else {
+                base.wrapping_shl(64 - i as u32)
             };
         }
         self.lj_base[MAX_CODE_LEN + 1] = 0;
@@ -774,58 +797,86 @@ impl FastHufDecoder {
     }
 }
 
-/// `FastHufDecoder_refill`.
-fn refill(
-    buffer: &mut u64,
-    mut num_bits: i32,
-    buffer_back: &mut u64,
-    buffer_back_num_bits: &mut i32,
-    input: &[u8],
-    curr: &mut usize,
-    curr_bits_left: &mut u64,
-) {
-    loop {
-        if num_bits > 0 {
-            let need_bits = 64 - num_bits;
-            *buffer |= *buffer_back >> num_bits;
-            if *buffer_back_num_bits >= need_bits {
-                *buffer_back = buffer_back.wrapping_shl(need_bits as u32);
-                *buffer_back_num_bits -= need_bits;
+/// The fast decoder's bits (`fasthuf_decode`'s state): `buffer`, the next bits, from its
+/// most significant end, with `buffer_bits` of them valid; `back`, the bits read after
+/// those, `back_bits` of them; and the input from `at`, `bits_left` bits of it.
+struct FastBits<'a> {
+    input: &'a [u8],
+    at: usize,
+    bits_left: u64,
+    buffer: u64,
+    buffer_bits: i32,
+    back: u64,
+    back_bits: i32,
+}
+
+impl<'a> FastBits<'a> {
+    /// The bits of `input` from `src`, `num_src_bits` of them, the first 128 read.
+    fn new(input: &'a [u8], src: usize, num_src_bits: u64) -> Self {
+        Self {
+            input,
+            at: src + 16,
+            bits_left: num_src_bits - 128,
+            buffer: read64(input, src),
+            buffer_bits: 64,
+            back: read64(input, src + 8),
+            back_bits: 64,
+        }
+    }
+
+    /// `FastHufDecoder_refill`: fills `buffer` from `back`, and `back` from the input.
+    fn refill(&mut self) {
+        let mut num_bits = self.buffer_bits;
+        loop {
+            if num_bits > 0 {
+                let need_bits = 64 - num_bits;
+                self.buffer |= self.back >> num_bits;
+                if self.back_bits >= need_bits {
+                    self.back = self.back.wrapping_shl(need_bits as u32);
+                    self.back_bits -= need_bits;
+                    break;
+                }
+                num_bits += self.back_bits;
+                self.back_bits = 0;
+            } else {
+                self.buffer = self.back;
+                num_bits = self.back_bits;
+                self.back_bits = 0;
+            }
+            if self.back_bits <= 0 {
+                if self.bits_left >= 64 {
+                    self.back = read64(self.input, self.at);
+                    self.back_bits = 64;
+                    self.at += 8;
+                    self.bits_left -= 64;
+                } else {
+                    let mut shift = 56u32;
+                    self.back = 0;
+                    self.back_bits = 64;
+                    while self.bits_left >= 8 {
+                        self.back |= u64::from(self.input[self.at]) << shift;
+                        self.at += 1;
+                        shift = shift.wrapping_sub(8);
+                        self.bits_left -= 8;
+                    }
+                    if self.bits_left > 0 {
+                        self.back |= u64::from(self.input[self.at]).wrapping_shl(shift);
+                        self.at += 1;
+                        self.bits_left = 0;
+                    }
+                }
+            }
+            if num_bits >= 64 {
                 break;
             }
-            num_bits += *buffer_back_num_bits;
-            *buffer_back_num_bits = 0;
-        } else {
-            *buffer = *buffer_back;
-            num_bits = *buffer_back_num_bits;
-            *buffer_back_num_bits = 0;
         }
-        if *buffer_back_num_bits <= 0 {
-            if *curr_bits_left >= 64 {
-                *buffer_back = read64(input, *curr);
-                *buffer_back_num_bits = 64;
-                *curr += 8;
-                *curr_bits_left -= 64;
-            } else {
-                let mut shift = 56u32;
-                *buffer_back = 0;
-                *buffer_back_num_bits = 64;
-                while *curr_bits_left >= 8 {
-                    *buffer_back |= u64::from(input[*curr]) << shift;
-                    *curr += 1;
-                    shift = shift.wrapping_sub(8);
-                    *curr_bits_left -= 8;
-                }
-                if *curr_bits_left > 0 {
-                    *buffer_back |= u64::from(input[*curr]).wrapping_shl(shift);
-                    *curr += 1;
-                    *curr_bits_left = 0;
-                }
-            }
-        }
-        if num_bits >= 64 {
-            break;
-        }
+        self.buffer_bits = 64;
+    }
+
+    /// Drops the first `n` bits of `buffer`.
+    fn consume(&mut self, n: u32) {
+        self.buffer = self.buffer.wrapping_shl(n);
+        self.buffer_bits -= n as i32;
     }
 }
 
@@ -838,43 +889,29 @@ impl FastHufDecoder {
         num_src_bits: u64,
         dst: &mut [u16],
     ) -> Result<(), Error> {
-        let mut curr = src + 16;
-        let mut num_src_bits = num_src_bits - 128;
-        let mut buffer = read64(input, src);
-        let mut buffer_num_bits = 64i32;
-        let mut buffer_back = read64(input, src + 8);
-        let mut buffer_back_num_bits = 64i32;
+        let mut bits = FastBits::new(input, src, num_src_bits);
         let mut dst_idx = 0usize;
         let t_min = self.table_min;
         let rle_sym = self.rle_symbol as u32;
 
         while dst_idx < dst.len() {
             let (symbol, code_len);
-            if t_min <= buffer {
-                let table_idx = (buffer >> INDEX_BIT_SHIFT) as usize;
+            if t_min <= bits.buffer {
+                let table_idx = (bits.buffer >> INDEX_BIT_SHIFT) as usize;
                 code_len = u32::from(self.table_code_len[table_idx]);
                 symbol = self.table_symbol[table_idx];
             } else {
-                if buffer_num_bits < 64 {
-                    refill(
-                        &mut buffer,
-                        buffer_num_bits,
-                        &mut buffer_back,
-                        &mut buffer_back_num_bits,
-                        input,
-                        &mut curr,
-                        &mut num_src_bits,
-                    );
-                    buffer_num_bits = 64;
+                if bits.buffer_bits < 64 {
+                    bits.refill();
                 }
                 let mut len = TABLE_LOOKUP_BITS as usize + 1;
-                while self.lj_base[len] > buffer {
+                while self.lj_base[len] > bits.buffer {
                     len += 1;
                 }
                 if len > self.max_code_length as usize {
                     return Err(Error::CorruptChunk);
                 }
-                let id = self.lj_offset[len].wrapping_add(buffer >> (64 - len));
+                let id = self.lj_offset[len].wrapping_add(bits.buffer >> (64 - len));
                 if id < u64::from(self.num_symbols) {
                     symbol = self.id_to_symbol[id as usize] as i32;
                 } else {
@@ -882,24 +919,13 @@ impl FastHufDecoder {
                 }
                 code_len = len as u32;
             }
-
-            buffer = buffer.wrapping_shl(code_len);
-            buffer_num_bits -= code_len as i32;
+            bits.consume(code_len);
 
             if symbol == rle_sym as i32 {
-                if buffer_num_bits < 8 {
-                    refill(
-                        &mut buffer,
-                        buffer_num_bits,
-                        &mut buffer_back,
-                        &mut buffer_back_num_bits,
-                        input,
-                        &mut curr,
-                        &mut num_src_bits,
-                    );
-                    buffer_num_bits = 64;
+                if bits.buffer_bits < 8 {
+                    bits.refill();
                 }
-                let rle_count = (buffer >> 56) as u32;
+                let rle_count = (bits.buffer >> 56) as u32;
                 if dst_idx < 1 {
                     return Err(Error::CorruptChunk);
                 }
@@ -912,27 +938,18 @@ impl FastHufDecoder {
                 let previous = dst[dst_idx - 1];
                 dst[dst_idx..dst_idx + rle_count as usize].fill(previous);
                 dst_idx += rle_count as usize;
-                buffer <<= 8;
-                buffer_num_bits -= 8;
+                bits.buffer <<= 8;
+                bits.buffer_bits -= 8;
             } else {
                 dst[dst_idx] = symbol as u16;
                 dst_idx += 1;
             }
 
-            if buffer_num_bits < TABLE_LOOKUP_BITS as i32 {
-                refill(
-                    &mut buffer,
-                    buffer_num_bits,
-                    &mut buffer_back,
-                    &mut buffer_back_num_bits,
-                    input,
-                    &mut curr,
-                    &mut num_src_bits,
-                );
-                buffer_num_bits = 64;
+            if bits.buffer_bits < TABLE_LOOKUP_BITS as i32 {
+                bits.refill();
             }
         }
-        if num_src_bits != 0 {
+        if bits.bits_left != 0 {
             return Err(Error::CorruptChunk);
         }
         Ok(())

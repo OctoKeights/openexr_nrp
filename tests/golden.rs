@@ -1,4 +1,4 @@
-//! openexr_nrp against hashes recorded from OpenEXRCore, so that any change in output shows
+//! `openexr_nrp` against hashes recorded from OpenEXRCore, so that any change in output shows
 //! without a C compiler.
 //!
 //! - `tests/data/dwa_write_expected.txt` is what `compare/dump_dwa.c`, built against
@@ -12,7 +12,7 @@
 
 mod made_up;
 
-fn same(printed: String, expected: &str) {
+fn same(printed: &str, expected: &str) {
     for (line, (ours, theirs)) in printed.lines().zip(expected.lines()).enumerate() {
         assert_eq!(ours, theirs, "line {}", line + 1);
     }
@@ -22,7 +22,7 @@ fn same(printed: String, expected: &str) {
 #[test]
 fn compresses_blocks_as_openexr_does() {
     same(
-        [
+        &[
             made_up::dwa("dwa_write", 3, 400),
             made_up::dwa("dwa_write", 8, 400),
         ]
@@ -34,7 +34,7 @@ fn compresses_blocks_as_openexr_does() {
 #[test]
 fn decompresses_damaged_blocks_as_openexr_does() {
     same(
-        [
+        &[
             made_up::dwa("dwa_read", 3, 600),
             made_up::dwa("dwa_read", 8, 600),
         ]

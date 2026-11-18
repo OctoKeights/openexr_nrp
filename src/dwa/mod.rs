@@ -33,7 +33,9 @@ use crate::{Error, PixelType};
 use libdeflate_nrp::Level;
 
 /// A table of a half for each half, from its little-endian bytes.
-const fn table(bytes: &[u8; 131072]) -> [u16; 65536] {
+// (Run only at compile time, to build the two tables, so its large array is no burden.)
+#[allow(clippy::large_stack_arrays)]
+const fn table(bytes: &[u8; 131_072]) -> [u16; 65536] {
     let mut table = [0; 65536];
     let mut i = 0;
     while i < 65536 {
@@ -275,12 +277,11 @@ fn classify(channels: &[Channel], rules: &[Rule]) -> (Vec<Scheme>, Vec<[usize; 3
         let name = channel.name.as_bytes();
         let suffix = find_suffix(name);
         let prefix = &name[..name.len() - suffix.len()];
-        let at = match prefix_map.iter().position(|(p, _)| *p == prefix) {
-            Some(at) => at,
-            None => {
-                prefix_map.push((prefix, [None; 3]));
-                prefix_map.len() - 1
-            }
+        let at = if let Some(at) = prefix_map.iter().position(|(p, _)| *p == prefix) {
+            at
+        } else {
+            prefix_map.push((prefix, [None; 3]));
+            prefix_map.len() - 1
         };
         for rule in rules {
             if rule_matches(rule, suffix, channel.pixel_type) {
@@ -325,7 +326,7 @@ fn layout(channels: &[Channel], rules: &[Rule], width: usize, lines: usize) -> L
                 rle_buffer_size += 2 * pixel_count * bpe;
                 planar_size[Scheme::Rle as usize] += 2 * pixel_count * bpe;
             }
-            _ => {
+            Scheme::Unknown => {
                 unknown_buffer_size += pixel_count * bpe;
                 planar_size[Scheme::Unknown as usize] += pixel_count * bpe;
             }
@@ -334,7 +335,7 @@ fn layout(channels: &[Channel], rules: &[Rule], width: usize, lines: usize) -> L
     out_buffer_size += compress_max_buffer_size(rle_buffer_size);
     out_buffer_size += compress_max_buffer_size(unknown_buffer_size);
     out_buffer_size += compress_max_buffer_size(max_dc * num_lossy);
-    out_buffer_size += NUM_SIZES * 8;
+    out_buffer_size += Counters::SIZE;
     if planar_size[Scheme::Unknown as usize] > 0 {
         planar_size[Scheme::Unknown as usize] =
             compress_max_buffer_size(planar_size[Scheme::Unknown as usize]);
@@ -364,23 +365,119 @@ fn layout(channels: &[Channel], rules: &[Rule], width: usize, lines: usize) -> L
     }
 }
 
-// The counters at the start of a block.
-const VERSION: usize = 0;
-const UNKNOWN_UNCOMPRESSED_SIZE: usize = 1;
-const UNKNOWN_COMPRESSED_SIZE: usize = 2;
-const AC_COMPRESSED_SIZE: usize = 3;
-const DC_COMPRESSED_SIZE: usize = 4;
-const RLE_COMPRESSED_SIZE: usize = 5;
-const RLE_UNCOMPRESSED_SIZE: usize = 6;
-const RLE_RAW_SIZE: usize = 7;
-const AC_UNCOMPRESSED_COUNT: usize = 8;
-const DC_UNCOMPRESSED_COUNT: usize = 9;
-const AC_COMPRESSION: usize = 10;
-const NUM_SIZES: usize = 11;
+/// The counters at the start of a block, in the order it stores them, as little-endian
+/// 64-bit values.
+#[derive(Clone, Copy, Default)]
+struct Counters {
+    version: u64,
+    unknown_uncompressed_size: u64,
+    unknown_compressed_size: u64,
+    ac_compressed_size: u64,
+    dc_compressed_size: u64,
+    rle_compressed_size: u64,
+    rle_uncompressed_size: u64,
+    rle_raw_size: u64,
+    ac_uncompressed_count: u64,
+    dc_uncompressed_count: u64,
+    /// How the AC coefficients are compressed: [`STATIC_HUFFMAN`] or [`DEFLATE`].
+    ac_compression: u64,
+}
 
 /// How the AC coefficients are compressed.
 const STATIC_HUFFMAN: u64 = 0;
 const DEFLATE: u64 = 1;
+
+impl Counters {
+    /// The bytes the counters take.
+    const SIZE: usize = 11 * 8;
+
+    fn to_array(self) -> [u64; 11] {
+        [
+            self.version,
+            self.unknown_uncompressed_size,
+            self.unknown_compressed_size,
+            self.ac_compressed_size,
+            self.dc_compressed_size,
+            self.rle_compressed_size,
+            self.rle_uncompressed_size,
+            self.rle_raw_size,
+            self.ac_uncompressed_count,
+            self.dc_uncompressed_count,
+            self.ac_compression,
+        ]
+    }
+
+    fn read(header: &[u8; Self::SIZE]) -> Self {
+        let [
+            version,
+            unknown_uncompressed_size,
+            unknown_compressed_size,
+            ac_compressed_size,
+            dc_compressed_size,
+            rle_compressed_size,
+            rle_uncompressed_size,
+            rle_raw_size,
+            ac_uncompressed_count,
+            dc_uncompressed_count,
+            ac_compression,
+        ] = {
+            let (words, _) = header.as_chunks::<8>();
+            core::array::from_fn(|i| u64::from_le_bytes(words[i]))
+        };
+        Self {
+            version,
+            unknown_uncompressed_size,
+            unknown_compressed_size,
+            ac_compressed_size,
+            dc_compressed_size,
+            rle_compressed_size,
+            rle_uncompressed_size,
+            rle_raw_size,
+            ac_uncompressed_count,
+            dc_uncompressed_count,
+            ac_compression,
+        }
+    }
+
+    fn write(self, out: &mut [u8]) {
+        for (bytes, value) in out.as_chunks_mut::<8>().0.iter_mut().zip(self.to_array()) {
+            *bytes = value.to_le_bytes();
+        }
+    }
+
+    /// The checks OpenEXRCore makes of the counters of a block of `block_size` bytes that
+    /// decompresses to `uncompressed_size`.
+    fn check(&self, block_size: u64, uncompressed_size: u64) -> Result<(), Error> {
+        let compressed_size = self
+            .unknown_compressed_size
+            .wrapping_add(self.ac_compressed_size)
+            .wrapping_add(self.dc_compressed_size)
+            .wrapping_add(self.rle_compressed_size);
+        // Both the sum and individual sizes are checked in case of overflow.
+        if block_size < (Self::SIZE as u64).wrapping_add(compressed_size)
+            || block_size < self.unknown_compressed_size
+            || block_size < self.ac_compressed_size
+            || block_size < self.dc_compressed_size
+            || block_size < self.rle_compressed_size
+        {
+            return Err(Error::CorruptChunk);
+        }
+        if self.unknown_uncompressed_size > uncompressed_size
+            || self.rle_raw_size > uncompressed_size
+            || self
+                .unknown_uncompressed_size
+                .wrapping_add(self.rle_raw_size)
+                > uncompressed_size
+        {
+            return Err(Error::CorruptChunk);
+        }
+        // (All but the version and the AC compression must be below 2^63.)
+        if self.to_array()[1..10].iter().any(|&size| (size as i64) < 0) {
+            return Err(Error::CorruptChunk);
+        }
+        Ok(())
+    }
+}
 
 // ---------------------------------------------------------------------------------------
 // RLE (`internal_rle.c`) and the byte order of ZIP (`internal_zip.c`).
@@ -511,6 +608,39 @@ fn zip_reconstruct_bytes(source: &mut [u8]) -> Vec<u8> {
 
 // ---------------------------------------------------------------------------------------
 
+/// Where a block's channels lie: each line holds every channel's values for that line, one
+/// channel after another.
+struct LineLayout {
+    /// The bytes of a line.
+    line_size: usize,
+    /// Where each channel starts within a line.
+    channel_at: Vec<usize>,
+    lines: usize,
+}
+
+impl LineLayout {
+    fn new(channels: &[Channel], width: usize, lines: usize) -> Self {
+        let mut channel_at = Vec::with_capacity(channels.len());
+        let mut line_size = 0;
+        for channel in channels {
+            channel_at.push(line_size);
+            line_size += width * channel.bytes_per_element();
+        }
+        Self {
+            line_size,
+            channel_at,
+            lines,
+        }
+    }
+
+    /// Where each line of channel `c` starts in the block.
+    fn rows(&self, c: usize) -> Vec<usize> {
+        (0..self.lines)
+            .map(|y| y * self.line_size + self.channel_at[c])
+            .collect()
+    }
+}
+
 /// Compresses the block `raw` of `width` pixels and `lines` lines with DWAA or DWAB
 /// (`DwaCompressor_compress`).
 ///
@@ -519,8 +649,10 @@ fn zip_reconstruct_bytes(source: &mut [u8]) -> Vec<u8> {
 /// `dwaCompressionLevel` (OpenEXR's default is 45): higher is smaller and lossier. A block
 /// that does not come out smaller is returned as it is, as OpenEXR stores it.
 ///
-/// Fails with [`Error::InvalidArgument`] when `raw` is not the length the channels, width and
-/// lines make.
+/// # Errors
+///
+/// [`Error::InvalidArgument`] when `raw` is not the length the channels, width and lines
+/// make.
 pub fn compress(
     raw: &[u8],
     channels: &[Channel],
@@ -529,197 +661,231 @@ pub fn compress(
     level: f32,
     ac_compression: AcCompression,
 ) -> Result<Vec<u8>, Error> {
-    let line_size: usize = channels
-        .iter()
-        .map(|channel| width * channel.bytes_per_element())
-        .sum();
-    if line_size.checked_mul(lines) != Some(raw.len()) {
+    let rows = LineLayout::new(channels, width, lines);
+    if rows.line_size.checked_mul(lines) != Some(raw.len()) {
         return Err(Error::InvalidArgument);
     }
     let rules = rules(false);
     let layout = layout(channels, &rules, width, lines);
-    let mut sizes = [0u64; NUM_SIZES];
-
-    // The rules relevant to the channels, after the counters.
-    let mut out = vec![0u8; NUM_SIZES * 8];
-    let rules_at = out.len();
-    out.extend_from_slice(&[0, 0]);
-    for rule in &rules {
-        if channels.iter().any(|channel| {
-            rule_matches(
-                rule,
-                find_suffix(channel.name.as_bytes()),
-                channel.pixel_type,
-            )
-        }) {
-            write_rule(rule, &mut out);
-        }
-    }
-    let rule_size = (out.len() - rules_at) as u16;
-    out[rules_at..rules_at + 2].copy_from_slice(&rule_size.to_le_bytes());
-
-    sizes[VERSION] = 2;
-    sizes[AC_COMPRESSION] = match ac_compression {
-        AcCompression::Huffman => STATIC_HUFFMAN,
-        AcCompression::Deflate => DEFLATE,
+    let encoder = Encoder {
+        raw,
+        channels,
+        width,
+        lines,
+        rows: &rows,
+        layout: &layout,
+        quant_base_error: level / 100_000.0,
     };
 
-    // Where each channel's lines start in `raw`.
-    let mut channel_at = Vec::with_capacity(channels.len());
-    let mut at = 0usize;
-    for channel in channels {
-        channel_at.push(at);
-        at += width * channel.bytes_per_element();
-    }
-    let rows =
-        |c: usize| -> Vec<usize> { (0..lines).map(|y| y * line_size + channel_at[c]).collect() };
+    let mut counters = Counters {
+        version: 2,
+        ac_compression: match ac_compression {
+            AcCompression::Huffman => STATIC_HUFFMAN,
+            AcCompression::Deflate => DEFLATE,
+        },
+        ..Counters::default()
+    };
+    // The counters, written last, then the rules relevant to the channels.
+    let mut out = vec![0u8; Counters::SIZE];
+    write_rules(&mut out, &rules, channels);
 
-    let quant_base_error = level / 100000.0;
     let mut coefficients = lossy::Coefficients::default();
-    let mut processed = vec![false; channels.len()];
-
-    for set in &layout.csc_sets {
-        let sources: Vec<lossy::Source> = set
-            .iter()
-            .map(|&c| lossy::Source {
-                rows: rows(c),
-                pixel_type: channels[c].pixel_type,
-            })
-            .collect();
-        lossy::encode(
-            raw,
-            &sources,
-            quant_base_error,
-            true,
-            width,
-            lines,
-            &mut coefficients,
-        );
-        for &c in set {
-            processed[c] = true;
-        }
-    }
-
-    // (Only the bytes the channels fill: OpenEXRCore's buffers are larger.)
-    let mut planar_unknown = vec![0u8; layout.unknown_size];
-    let mut planar_rle = vec![0u8; layout.planar_size[Scheme::Rle as usize]];
-    for (c, channel) in channels.iter().enumerate() {
-        if processed[c] {
-            continue;
-        }
-        let bpe = channel.bytes_per_element();
-        let row_bytes = width * bpe;
-        match layout.compression[c] {
-            Scheme::LossyDct => {
-                let source = lossy::Source {
-                    rows: rows(c),
-                    pixel_type: channel.pixel_type,
-                };
-                lossy::encode(
-                    raw,
-                    &[source],
-                    quant_base_error,
-                    !channel.linear,
-                    width,
-                    lines,
-                    &mut coefficients,
-                );
-            }
-            Scheme::Rle => {
-                // The first bytes of each value together, then the second, and so on.
-                let plane = width * lines;
-                let base = layout.planar_at[c];
-                let mut end = [0usize; 4];
-                for row in rows(c) {
-                    for x in 0..width {
-                        for (byte, e) in end.iter_mut().enumerate().take(bpe) {
-                            planar_rle[base + byte * plane + *e] = raw[row + x * bpe + byte];
-                            *e += 1;
-                        }
-                    }
-                    sizes[RLE_RAW_SIZE] += row_bytes as u64;
-                }
-            }
-            _ => {
-                let base = layout.planar_at[c];
-                for (y, row) in rows(c).into_iter().enumerate() {
-                    planar_unknown[base + y * row_bytes..base + (y + 1) * row_bytes]
-                        .copy_from_slice(&raw[row..row + row_bytes]);
-                }
-                sizes[UNKNOWN_UNCOMPRESSED_SIZE] += (width * lines * bpe) as u64;
-            }
-        }
-        processed[c] = true;
-    }
+    let processed = encoder.encode_csc_sets(&mut coefficients);
+    let planar = encoder.split_channels(&processed, &mut coefficients, &mut counters);
     let lossy::Coefficients {
         ac: packed_ac,
         dc: packed_dc,
     } = coefficients;
-    sizes[AC_UNCOMPRESSED_COUNT] = packed_ac.len() as u64;
-    sizes[DC_UNCOMPRESSED_COUNT] = packed_dc.len() as u64;
+    counters.ac_uncompressed_count = packed_ac.len() as u64;
+    counters.dc_uncompressed_count = packed_dc.len() as u64;
 
-    if sizes[UNKNOWN_UNCOMPRESSED_SIZE] > 0 {
-        let packed = compress_buffer(
-            Level::BEST,
-            &planar_unknown[..sizes[UNKNOWN_UNCOMPRESSED_SIZE] as usize],
-        );
-        sizes[UNKNOWN_COMPRESSED_SIZE] = packed.len() as u64;
+    // UNKNOWN data first, then the AC coefficients, the DC values and the RLE data.
+    if counters.unknown_uncompressed_size > 0 {
+        let size = counters.unknown_uncompressed_size as usize;
+        let packed = compress_buffer(Level::BEST, &planar.unknown[..size]);
+        counters.unknown_compressed_size = packed.len() as u64;
         out.extend_from_slice(&packed);
     }
-
     if !packed_ac.is_empty() {
-        match ac_compression {
+        let packed = match ac_compression {
             AcCompression::Deflate => {
                 let bytes: Vec<u8> = packed_ac.iter().flat_map(|v| v.to_le_bytes()).collect();
-                let packed = compress_buffer(Level::BEST, &bytes);
-                sizes[AC_COMPRESSED_SIZE] = packed.len() as u64;
-                out.extend_from_slice(&packed);
+                compress_buffer(Level::BEST, &bytes)
             }
             AcCompression::Huffman => {
                 match huf::compress(&packed_ac, layout.out_buffer_size - out.len()) {
-                    Ok(packed) => {
-                        sizes[AC_COMPRESSED_SIZE] = packed.len() as u64;
-                        out.extend_from_slice(&packed);
-                    }
+                    Ok(packed) => packed,
                     // (Stored as it is, the block too large for the coder.)
                     Err(_) => return Ok(raw.to_vec()),
                 }
             }
-        }
+        };
+        counters.ac_compressed_size = packed.len() as u64;
+        out.extend_from_slice(&packed);
     }
-
     if !packed_dc.is_empty() {
         let bytes: Vec<u8> = packed_dc.iter().flat_map(|v| v.to_le_bytes()).collect();
         let packed = compress_buffer(DEFAULT_LEVEL, &zip_deconstruct_bytes(&bytes));
-        sizes[DC_COMPRESSED_SIZE] = packed.len() as u64;
+        counters.dc_compressed_size = packed.len() as u64;
         out.extend_from_slice(&packed);
     }
-
-    if sizes[RLE_RAW_SIZE] > 0 {
-        let rle = rle_compress(
-            &planar_rle[..sizes[RLE_RAW_SIZE] as usize],
-            layout.rle_buffer_size,
-        );
-        sizes[RLE_UNCOMPRESSED_SIZE] = rle.len() as u64;
+    if counters.rle_raw_size > 0 {
+        let size = counters.rle_raw_size as usize;
+        let rle = rle_compress(&planar.rle[..size], layout.rle_buffer_size);
+        counters.rle_uncompressed_size = rle.len() as u64;
         let packed = compress_buffer(Level::BEST, &rle);
-        sizes[RLE_COMPRESSED_SIZE] = packed.len() as u64;
+        counters.rle_compressed_size = packed.len() as u64;
         out.extend_from_slice(&packed);
     }
 
-    for (i, size) in sizes.iter().enumerate() {
-        out[8 * i..8 * i + 8].copy_from_slice(&size.to_le_bytes());
-    }
+    counters.write(&mut out[..Counters::SIZE]);
     if out.len() >= raw.len() {
         return Ok(raw.to_vec());
     }
     Ok(out)
 }
 
+/// Writes the rules that match one of `channels` or more, after their size in bytes.
+fn write_rules(out: &mut Vec<u8>, rules: &[Rule], channels: &[Channel]) {
+    let rules_at = out.len();
+    out.extend_from_slice(&[0, 0]);
+    for rule in rules {
+        let matches = |channel: &Channel| {
+            let suffix = find_suffix(channel.name.as_bytes());
+            rule_matches(rule, suffix, channel.pixel_type)
+        };
+        if channels.iter().any(matches) {
+            write_rule(rule, out);
+        }
+    }
+    let rule_size = (out.len() - rules_at) as u16;
+    out[rules_at..rules_at + 2].copy_from_slice(&rule_size.to_le_bytes());
+}
+
+/// The channels' data, rearranged for the schemes that are not lossy.
+struct Planar {
+    /// The channels kept whole (UNKNOWN), one after another.
+    unknown: Vec<u8>,
+    /// The channels run-length coded, each as the planes of its values' bytes.
+    rle: Vec<u8>,
+}
+
+/// A block being compressed, and what is known of its channels.
+struct Encoder<'a> {
+    raw: &'a [u8],
+    channels: &'a [Channel<'a>],
+    width: usize,
+    lines: usize,
+    rows: &'a LineLayout,
+    layout: &'a Layout,
+    quant_base_error: f32,
+}
+
+impl Encoder<'_> {
+    /// Codes each set of red, green and blue channels into `coefficients` as Y'CbCr, and
+    /// returns which channels those are.
+    fn encode_csc_sets(&self, coefficients: &mut lossy::Coefficients) -> Vec<bool> {
+        let mut processed = vec![false; self.channels.len()];
+        for set in &self.layout.csc_sets {
+            let sources: Vec<lossy::Source> = set
+                .iter()
+                .map(|&c| lossy::Source {
+                    rows: self.rows.rows(c),
+                    pixel_type: self.channels[c].pixel_type,
+                })
+                .collect();
+            let (width, lines) = (self.width, self.lines);
+            let base_error = self.quant_base_error;
+            lossy::encode(
+                self.raw,
+                &sources,
+                base_error,
+                true,
+                width,
+                lines,
+                coefficients,
+            );
+            for &c in set {
+                processed[c] = true;
+            }
+        }
+        processed
+    }
+
+    /// Codes each channel not yet `processed` by its scheme: lossy ones into `coefficients`,
+    /// the others into the planar buffers returned, counting their bytes in `counters`.
+    fn split_channels(
+        &self,
+        processed: &[bool],
+        coefficients: &mut lossy::Coefficients,
+        counters: &mut Counters,
+    ) -> Planar {
+        let (raw, width, lines) = (self.raw, self.width, self.lines);
+        // (Only the bytes the channels fill: OpenEXRCore's buffers are larger.)
+        let mut planar = Planar {
+            unknown: vec![0u8; self.layout.unknown_size],
+            rle: vec![0u8; self.layout.planar_size[Scheme::Rle as usize]],
+        };
+        for (c, channel) in self.channels.iter().enumerate() {
+            if processed[c] {
+                continue;
+            }
+            let bpe = channel.bytes_per_element();
+            let row_bytes = width * bpe;
+            let base = self.layout.planar_at[c];
+            match self.layout.compression[c] {
+                Scheme::LossyDct => {
+                    let source = lossy::Source {
+                        rows: self.rows.rows(c),
+                        pixel_type: channel.pixel_type,
+                    };
+                    let base_error = self.quant_base_error;
+                    let nonlinear = !channel.linear;
+                    lossy::encode(
+                        raw,
+                        &[source],
+                        base_error,
+                        nonlinear,
+                        width,
+                        lines,
+                        coefficients,
+                    );
+                }
+                Scheme::Rle => {
+                    // The first bytes of each value together, then the second, and so on.
+                    let plane = width * lines;
+                    let mut end = [0usize; 4];
+                    for row in self.rows.rows(c) {
+                        for x in 0..width {
+                            for (byte, e) in end.iter_mut().enumerate().take(bpe) {
+                                planar.rle[base + byte * plane + *e] = raw[row + x * bpe + byte];
+                                *e += 1;
+                            }
+                        }
+                        counters.rle_raw_size += row_bytes as u64;
+                    }
+                }
+                Scheme::Unknown => {
+                    for (y, row) in self.rows.rows(c).into_iter().enumerate() {
+                        planar.unknown[base + y * row_bytes..base + (y + 1) * row_bytes]
+                            .copy_from_slice(&raw[row..row + row_bytes]);
+                    }
+                    counters.unknown_uncompressed_size += (width * lines * bpe) as u64;
+                }
+            }
+        }
+        planar
+    }
+}
+
 /// Decompresses the DWAA or DWAB block `data` of `width` pixels and `lines` lines into `out`
 /// (`DwaCompressor_uncompress`).
 ///
 /// `out` is the block's uncompressed size, and receives its lines as [`compress`] takes them.
-/// A block that OpenEXRCore refuses fails with the [`Error`] it reports, most often
+///
+/// # Errors
+///
+/// For a block that OpenEXRCore refuses, the [`Error`] it reports, most often
 /// [`Error::CorruptChunk`].
 pub fn decompress(
     data: &[u8],
@@ -728,315 +894,334 @@ pub fn decompress(
     lines: usize,
     out: &mut [u8],
 ) -> Result<(), Error> {
-    let header_size = (NUM_SIZES * 8) as u64;
-    let i_size = data.len() as u64;
-    if i_size < header_size {
+    let Some(header) = data.first_chunk::<{ Counters::SIZE }>() else {
         return Err(Error::CorruptChunk);
-    }
+    };
     out.fill(0);
-    let uncompressed_size = out.len() as u64;
+    let counters = Counters::read(header);
+    counters.check(data.len() as u64, out.len() as u64)?;
 
-    let counter =
-        |i: usize| u64::from_le_bytes(data[8 * i..8 * i + 8].try_into().expect("eight bytes"));
-    let version = counter(VERSION);
-    let unknown_uncompressed_size = counter(UNKNOWN_UNCOMPRESSED_SIZE);
-    let unknown_compressed_size = counter(UNKNOWN_COMPRESSED_SIZE);
-    let ac_compressed_size = counter(AC_COMPRESSED_SIZE);
-    let dc_compressed_size = counter(DC_COMPRESSED_SIZE);
-    let rle_compressed_size = counter(RLE_COMPRESSED_SIZE);
-    let rle_uncompressed_size = counter(RLE_UNCOMPRESSED_SIZE);
-    let rle_raw_size = counter(RLE_RAW_SIZE);
-    let total_ac_count = counter(AC_UNCOMPRESSED_COUNT);
-    let total_dc_count = counter(DC_UNCOMPRESSED_COUNT);
-    let ac_compression = counter(AC_COMPRESSION);
-
-    let compressed_size = unknown_compressed_size
-        .wrapping_add(ac_compressed_size)
-        .wrapping_add(dc_compressed_size)
-        .wrapping_add(rle_compressed_size);
-
-    // Both the sum and individual sizes are checked in case of overflow.
-    if i_size < header_size.wrapping_add(compressed_size)
-        || i_size < unknown_compressed_size
-        || i_size < ac_compressed_size
-        || i_size < dc_compressed_size
-        || i_size < rle_compressed_size
-    {
-        return Err(Error::CorruptChunk);
-    }
-    if unknown_uncompressed_size > uncompressed_size
-        || rle_raw_size > uncompressed_size
-        || unknown_uncompressed_size.wrapping_add(rle_raw_size) > uncompressed_size
-    {
-        return Err(Error::CorruptChunk);
-    }
-    if [
-        unknown_uncompressed_size,
-        unknown_compressed_size,
-        ac_compressed_size,
-        dc_compressed_size,
-        rle_compressed_size,
-        rle_uncompressed_size,
-        rle_raw_size,
-        total_ac_count,
-        total_dc_count,
-    ]
-    .iter()
-    .any(|&size| (size as i64) < 0)
-    {
-        return Err(Error::CorruptChunk);
-    }
-
-    let mut data_at = header_size as usize;
-    let rules = if version < 2 {
+    let mut data_at = Counters::SIZE;
+    let rules = if counters.version < 2 {
         rules(true)
     } else {
-        // DwaCompressor_readChannelRules
-        let n_avail = data.len() - data_at;
-        if n_avail <= 2 {
-            return Err(Error::CorruptChunk);
-        }
-        let rule_size = usize::from(u16::from_le_bytes([data[data_at], data[data_at + 1]]));
-        if rule_size < 2 {
-            return Err(Error::CorruptChunk);
-        }
-        if n_avail < rule_size {
-            return Err(Error::CorruptChunk);
-        }
-        let mut rule_data = &data[data_at + 2..data_at + rule_size];
-        data_at += rule_size;
-        let mut rules = Vec::new();
-        while !rule_data.is_empty() {
-            let (rule, taken) = read_rule(rule_data)?;
-            rules.push(rule);
-            rule_data = &rule_data[taken..];
-        }
+        let (rules, size) = read_rules(&data[data_at..])?;
+        data_at += size;
         rules
     };
-
     let layout = layout(channels, &rules, width, lines);
-
-    // UNKNOWN data is packed first, followed by the Huffman-compressed AC, then the DC
-    // values, and then the zlib compressed RLE data.
-    let unknown_at = data_at as u64;
-    let ac_at = unknown_at + unknown_compressed_size;
-    let dc_at = ac_at + ac_compressed_size;
-    let rle_at = dc_at + dc_compressed_size;
-    if ac_at > i_size || dc_at > i_size || rle_at > i_size || rle_at + rle_compressed_size > i_size
-    {
-        return Err(Error::CorruptChunk);
-    }
-
-    if version > 2 {
+    let parts = Parts::locate(data, data_at, &counters)?;
+    if counters.version > 2 {
         return Err(Error::BadChunkLeader);
     }
-
-    // validate_size
-    let validate =
-        |scheme: Scheme, compressed: u64, uncompressed: u64, extra: u64| -> Result<(), Error> {
-            let required: u64 = channels
-                .iter()
-                .enumerate()
-                .filter(|(c, _)| layout.compression[*c] == scheme)
-                .map(|(_, channel)| (width * lines * channel.bytes_per_element()) as u64)
-                .sum();
-            if required > 0 {
-                if uncompressed < required || compressed == 0 {
-                    return Err(Error::CorruptChunk);
-                }
-            } else if uncompressed > 0 || compressed > 0 || extra > 0 {
-                return Err(Error::CorruptChunk);
-            }
-            Ok(())
-        };
-    validate(
-        Scheme::Unknown,
-        unknown_compressed_size,
-        unknown_uncompressed_size,
+    let required = |scheme: Scheme| -> u64 {
+        let bytes = |(_, channel): (usize, &Channel)| width * lines * channel.bytes_per_element();
+        let of_scheme = |(c, _): &(usize, &Channel)| layout.compression[*c] == scheme;
+        channels
+            .iter()
+            .enumerate()
+            .filter(of_scheme)
+            .map(bytes)
+            .sum::<usize>() as u64
+    };
+    validate_size(
+        required(Scheme::Unknown),
+        counters.unknown_compressed_size,
+        counters.unknown_uncompressed_size,
         0,
     )?;
-    validate(
-        Scheme::Rle,
-        rle_compressed_size,
-        rle_raw_size,
-        rle_uncompressed_size,
+    validate_size(
+        required(Scheme::Rle),
+        counters.rle_compressed_size,
+        counters.rle_raw_size,
+        counters.rle_uncompressed_size,
     )?;
 
-    let part = |at: u64, size: u64| &data[at as usize..(at + size) as usize];
+    let unpacked = Unpacked {
+        unknown: parts.unpack_unknown(&counters, &layout)?,
+        ac: parts.unpack_ac(&counters, &layout)?,
+        dc: parts.unpack_dc(&counters, &layout)?,
+        rle: parts.unpack_rle(&counters, &layout)?,
+    };
+    let decoder = Decoding {
+        channels,
+        width,
+        lines,
+        rows: LineLayout::new(channels, width, lines),
+        layout: &layout,
+    };
+    decoder.decode(out, &unpacked, &counters)
+}
 
-    // (Only the bytes the stream holds or the channels read: OpenEXRCore's buffer is larger.)
-    if unknown_uncompressed_size > layout.planar_size[Scheme::Unknown as usize] as u64 {
+/// `DwaCompressor_readChannelRules`: the rules at the start of `data`, and the bytes they
+/// take.
+fn read_rules(data: &[u8]) -> Result<(Vec<Rule>, usize), Error> {
+    if data.len() <= 2 {
         return Err(Error::CorruptChunk);
     }
-    let mut planar_unknown = vec![0u8; layout.unknown_size.max(unknown_uncompressed_size as usize)];
-    if unknown_compressed_size > 0 {
-        let made = uncompress_buffer(
-            part(unknown_at, unknown_compressed_size),
-            &mut planar_unknown[..unknown_uncompressed_size as usize],
-        )
-        .map_err(|_| Error::CorruptChunk)?;
-        if made as u64 != unknown_uncompressed_size {
+    let rule_size = usize::from(u16::from_le_bytes([data[0], data[1]]));
+    if rule_size < 2 || data.len() < rule_size {
+        return Err(Error::CorruptChunk);
+    }
+    let mut rule_data = &data[2..rule_size];
+    let mut rules = Vec::new();
+    while !rule_data.is_empty() {
+        let (rule, taken) = read_rule(rule_data)?;
+        rules.push(rule);
+        rule_data = &rule_data[taken..];
+    }
+    Ok((rules, rule_size))
+}
+
+/// `validate_size`: a scheme's sizes agree with the bytes its channels need, `required`.
+fn validate_size(
+    required: u64,
+    compressed: u64,
+    uncompressed: u64,
+    extra: u64,
+) -> Result<(), Error> {
+    let agree = if required > 0 {
+        uncompressed >= required && compressed > 0
+    } else {
+        uncompressed == 0 && compressed == 0 && extra == 0
+    };
+    if agree {
+        Ok(())
+    } else {
+        Err(Error::CorruptChunk)
+    }
+}
+
+/// The compressed parts of a block, in the order it stores them.
+struct Parts<'a> {
+    unknown: &'a [u8],
+    ac: &'a [u8],
+    dc: &'a [u8],
+    rle: &'a [u8],
+}
+
+impl<'a> Parts<'a> {
+    /// The parts of `data` from `at`, as its counters size them.
+    fn locate(data: &'a [u8], at: usize, counters: &Counters) -> Result<Self, Error> {
+        let block_size = data.len() as u64;
+        let unknown_at = at as u64;
+        let ac_at = unknown_at + counters.unknown_compressed_size;
+        let dc_at = ac_at + counters.ac_compressed_size;
+        let rle_at = dc_at + counters.dc_compressed_size;
+        let rle_end = rle_at + counters.rle_compressed_size;
+        if ac_at > block_size || dc_at > block_size || rle_at > block_size || rle_end > block_size {
             return Err(Error::CorruptChunk);
         }
+        let part = |from: u64, to: u64| &data[from as usize..to as usize];
+        Ok(Self {
+            unknown: part(unknown_at, ac_at),
+            ac: part(ac_at, dc_at),
+            dc: part(dc_at, rle_at),
+            rle: part(rle_at, rle_end),
+        })
     }
 
-    let mut packed_ac = vec![0u16; layout.packed_ac_size / 2];
-    if ac_compressed_size > 0 {
-        if layout.packed_ac_size == 0 || total_ac_count * 2 > layout.packed_ac_size as u64 {
+    /// The channels kept whole, after ZIP.
+    fn unpack_unknown(&self, counters: &Counters, layout: &Layout) -> Result<Vec<u8>, Error> {
+        let size = counters.unknown_uncompressed_size;
+        // (Only the bytes the stream holds or the channels read: OpenEXRCore's buffer is
+        // larger.)
+        if size > layout.planar_size[Scheme::Unknown as usize] as u64 {
             return Err(Error::CorruptChunk);
         }
-        let count = total_ac_count as usize;
-        match ac_compression {
-            STATIC_HUFFMAN => {
-                huf::decompress(part(ac_at, ac_compressed_size), &mut packed_ac[..count])?
+        let mut planar = vec![0u8; layout.unknown_size.max(size as usize)];
+        if counters.unknown_compressed_size > 0 {
+            let made = uncompress_buffer(self.unknown, &mut planar[..size as usize])
+                .map_err(|_| Error::CorruptChunk)?;
+            if made as u64 != size {
+                return Err(Error::CorruptChunk);
             }
+        }
+        Ok(planar)
+    }
+
+    /// The AC coefficients, after Huffman coding or ZIP.
+    fn unpack_ac(&self, counters: &Counters, layout: &Layout) -> Result<Vec<u16>, Error> {
+        let mut packed = vec![0u16; layout.packed_ac_size / 2];
+        if counters.ac_compressed_size == 0 {
+            return Ok(packed);
+        }
+        let count = counters.ac_uncompressed_count;
+        if layout.packed_ac_size == 0 || count * 2 > layout.packed_ac_size as u64 {
+            return Err(Error::CorruptChunk);
+        }
+        let count = count as usize;
+        match counters.ac_compression {
+            STATIC_HUFFMAN => huf::decompress(self.ac, &mut packed[..count])?,
             DEFLATE => {
                 let mut bytes = vec![0u8; count * 2];
-                let made = uncompress_buffer(part(ac_at, ac_compressed_size), &mut bytes)?;
+                let made = uncompress_buffer(self.ac, &mut bytes)?;
                 if made != count * 2 {
                     return Err(Error::CorruptChunk);
                 }
-                for (value, pair) in packed_ac.iter_mut().zip(bytes.as_chunks::<2>().0.iter()) {
-                    *value = u16::from_le_bytes([pair[0], pair[1]]);
+                for (value, pair) in packed.iter_mut().zip(bytes.as_chunks::<2>().0) {
+                    *value = u16::from_le_bytes(*pair);
                 }
             }
             _ => return Err(Error::CorruptChunk),
         }
+        Ok(packed)
     }
 
-    let mut packed_dc = vec![0u16; layout.packed_dc_size / 2];
-    if dc_compressed_size > 0 {
-        let uncomp_bytes = total_dc_count * 2;
-        if uncomp_bytes > layout.packed_dc_size as u64 {
+    /// The DC values, after ZIP of their reordered bytes.
+    fn unpack_dc(&self, counters: &Counters, layout: &Layout) -> Result<Vec<u16>, Error> {
+        let mut packed = vec![0u16; layout.packed_dc_size / 2];
+        if counters.dc_compressed_size == 0 {
+            // If the compressed size is 0, then the uncompressed size must also be zero.
+            return if counters.dc_uncompressed_count == 0 {
+                Ok(packed)
+            } else {
+                Err(Error::CorruptChunk)
+            };
+        }
+        let size = counters.dc_uncompressed_count * 2;
+        if size > layout.packed_dc_size as u64 {
             return Err(Error::CorruptChunk);
         }
-        let mut scratch = vec![0u8; uncomp_bytes as usize];
-        match uncompress_buffer(part(dc_at, dc_compressed_size), &mut scratch) {
-            Ok(made) if made as u64 == uncomp_bytes => {}
+        let mut scratch = vec![0u8; size as usize];
+        match uncompress_buffer(self.dc, &mut scratch) {
+            Ok(made) if made as u64 == size => {}
             _ => return Err(Error::CorruptChunk),
         }
         let bytes = zip_reconstruct_bytes(&mut scratch);
-        for (value, pair) in packed_dc.iter_mut().zip(bytes.as_chunks::<2>().0.iter()) {
-            *value = u16::from_le_bytes([pair[0], pair[1]]);
+        for (value, pair) in packed.iter_mut().zip(bytes.as_chunks::<2>().0) {
+            *value = u16::from_le_bytes(*pair);
         }
-    } else if total_dc_count != 0 {
-        // if the compressed size is 0, then the uncompressed size must also be zero
-        return Err(Error::CorruptChunk);
+        Ok(packed)
     }
 
-    let mut planar_rle = vec![0u8; layout.planar_size[Scheme::Rle as usize]];
-    if rle_raw_size > 0 {
-        if rle_uncompressed_size > layout.rle_buffer_size as u64
-            || rle_raw_size > planar_rle.len() as u64
-        {
+    /// The run-length coded channels, after ZIP and the run-length decoding.
+    fn unpack_rle(&self, counters: &Counters, layout: &Layout) -> Result<Vec<u8>, Error> {
+        let mut planar = vec![0u8; layout.planar_size[Scheme::Rle as usize]];
+        let raw_size = counters.rle_raw_size;
+        if raw_size == 0 {
+            return Ok(planar);
+        }
+        let size = counters.rle_uncompressed_size;
+        if size > layout.rle_buffer_size as u64 || raw_size > planar.len() as u64 {
             return Err(Error::CorruptChunk);
         }
-        let mut rle = vec![0u8; rle_uncompressed_size as usize];
-        match uncompress_buffer(part(rle_at, rle_compressed_size), &mut rle) {
-            Ok(made) if made as u64 == rle_uncompressed_size => {}
+        let mut rle = vec![0u8; size as usize];
+        match uncompress_buffer(self.rle, &mut rle) {
+            Ok(made) if made as u64 == size => {}
             _ => return Err(Error::CorruptChunk),
         }
-        if rle_decompress(&mut planar_rle[..rle_raw_size as usize], &rle) as u64 != rle_raw_size {
+        if rle_decompress(&mut planar[..raw_size as usize], &rle) as u64 != raw_size {
             return Err(Error::CorruptChunk);
         }
+        Ok(planar)
     }
+}
 
-    // Where each channel's lines start in `out`.
-    let line_size: usize = channels
-        .iter()
-        .map(|channel| width * channel.bytes_per_element())
-        .sum();
-    let mut channel_at = Vec::with_capacity(channels.len());
-    let mut at = 0usize;
-    for channel in channels {
-        channel_at.push(at);
-        at += width * channel.bytes_per_element();
-    }
-    let rows =
-        |c: usize| -> Vec<usize> { (0..lines).map(|y| y * line_size + channel_at[c]).collect() };
+/// A block's parts, decompressed.
+struct Unpacked {
+    unknown: Vec<u8>,
+    ac: Vec<u16>,
+    dc: Vec<u16>,
+    rle: Vec<u8>,
+}
 
-    let mut decoder = lossy::Decoder::new(channels.len());
-    let mut packed = lossy::Packed {
-        ac: &packed_ac,
-        ac_at: 0,
-        ac_left: total_ac_count,
-        dc: &packed_dc,
-        dc_at: 0,
-        dc_left: total_dc_count,
-    };
-    let mut processed = vec![false; channels.len()];
+/// A block being decompressed, and what is known of its channels.
+struct Decoding<'a> {
+    channels: &'a [Channel<'a>],
+    width: usize,
+    lines: usize,
+    rows: LineLayout,
+    layout: &'a Layout,
+}
 
-    for set in &layout.csc_sets {
-        if set
-            .iter()
-            .any(|&c| layout.compression[c] != Scheme::LossyDct)
-        {
-            return Err(Error::CorruptChunk);
-        }
-        let targets: Vec<lossy::Target> = set
-            .iter()
-            .map(|&c| lossy::Target {
-                channel: c,
-                rows: rows(c),
-                pixel_type: channels[c].pixel_type,
-            })
-            .collect();
-        let result = decoder.decode(out, &targets, &mut packed, true, width, lines);
-        for &c in set {
-            processed[c] = true;
-        }
-        result?;
-    }
+impl Decoding<'_> {
+    /// Decodes every channel into `out`: the sets of red, green and blue first, from Y'CbCr,
+    /// then the others in order, each by its scheme.
+    fn decode(
+        &self,
+        out: &mut [u8],
+        unpacked: &Unpacked,
+        counters: &Counters,
+    ) -> Result<(), Error> {
+        let (width, lines, layout) = (self.width, self.lines, self.layout);
+        let mut decoder = lossy::Decoder::new(self.channels.len());
+        let mut packed = lossy::Packed {
+            ac: &unpacked.ac,
+            ac_at: 0,
+            ac_left: counters.ac_uncompressed_count,
+            dc: &unpacked.dc,
+            dc_at: 0,
+            dc_left: counters.dc_uncompressed_count,
+        };
+        let mut processed = vec![false; self.channels.len()];
 
-    for (c, channel) in channels.iter().enumerate() {
-        if processed[c] {
-            continue;
-        }
-        if width == 0 || lines == 0 {
-            processed[c] = true;
-            continue;
-        }
-        let bpe = channel.bytes_per_element();
-        match layout.compression[c] {
-            Scheme::LossyDct => {
-                let target = lossy::Target {
-                    channel: c,
-                    rows: rows(c),
-                    pixel_type: channel.pixel_type,
-                };
-                let result =
-                    decoder.decode(out, &[target], &mut packed, !channel.linear, width, lines);
-                result?;
+        for set in &layout.csc_sets {
+            if set
+                .iter()
+                .any(|&c| layout.compression[c] != Scheme::LossyDct)
+            {
+                return Err(Error::CorruptChunk);
             }
-            Scheme::Rle => {
-                let plane = width * lines;
-                let base = layout.planar_at[c];
-                let mut end = [0usize; 4];
-                for row in rows(c) {
-                    for x in 0..width {
-                        for (byte, e) in end.iter_mut().enumerate().take(bpe) {
-                            out[row + x * bpe + byte] = planar_rle[base + byte * plane + *e];
-                            *e += 1;
+            let targets: Vec<lossy::Target> = set
+                .iter()
+                .map(|&c| lossy::Target {
+                    channel: c,
+                    rows: self.rows.rows(c),
+                    pixel_type: self.channels[c].pixel_type,
+                })
+                .collect();
+            let result = decoder.decode(out, &targets, &mut packed, true, width, lines);
+            for &c in set {
+                processed[c] = true;
+            }
+            result?;
+        }
+
+        for (c, channel) in self.channels.iter().enumerate() {
+            if processed[c] || width == 0 || lines == 0 {
+                continue;
+            }
+            let bpe = channel.bytes_per_element();
+            match layout.compression[c] {
+                Scheme::LossyDct => {
+                    let target = lossy::Target {
+                        channel: c,
+                        rows: self.rows.rows(c),
+                        pixel_type: channel.pixel_type,
+                    };
+                    let nonlinear = !channel.linear;
+                    decoder.decode(out, &[target], &mut packed, nonlinear, width, lines)?;
+                }
+                Scheme::Rle => {
+                    let plane = width * lines;
+                    let base = layout.planar_at[c];
+                    let mut end = [0usize; 4];
+                    for row in self.rows.rows(c) {
+                        for x in 0..width {
+                            for (byte, e) in end.iter_mut().enumerate().take(bpe) {
+                                out[row + x * bpe + byte] = unpacked.rle[base + byte * plane + *e];
+                                *e += 1;
+                            }
                         }
                     }
                 }
-            }
-            Scheme::Unknown => {
-                let row_bytes = width * bpe;
-                let mut at = layout.planar_at[c];
-                for row in rows(c) {
-                    // sanity check for buffer data lying within range
-                    if at + row_bytes > planar_unknown.len() {
-                        return Err(Error::CorruptChunk);
+                Scheme::Unknown => {
+                    let row_bytes = width * bpe;
+                    let mut at = layout.planar_at[c];
+                    for row in self.rows.rows(c) {
+                        // (A sanity check that the data lies within range.)
+                        let Some(source) = unpacked.unknown.get(at..at + row_bytes) else {
+                            return Err(Error::CorruptChunk);
+                        };
+                        out[row..row + row_bytes].copy_from_slice(source);
+                        at += row_bytes;
                     }
-                    out[row..row + row_bytes].copy_from_slice(&planar_unknown[at..at + row_bytes]);
-                    at += row_bytes;
                 }
             }
         }
-        processed[c] = true;
+        Ok(())
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1103,7 +1288,7 @@ mod tests {
                 linear: false,
             })
             .collect();
-        let half = |f: f32| simd::float_to_half(f) as u32;
+        let half = |f: f32| u32::from(simd::float_to_half(f));
         let raw = block(64, 40, &channels, |c, x, y| {
             half(0.25 + (x + 2 * y + 9 * c) as f32 / 200.0)
         });

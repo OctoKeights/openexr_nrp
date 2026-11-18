@@ -2,15 +2,10 @@
 //! (`compare/dump_dwa.c`) generates it, and the dumps that both the golden tests and
 //! `examples/dump.rs` run.
 
-// (The arithmetic is written as the C side has it; not every user of this module uses all of
-// it.)
-#![allow(
-    clippy::manual_is_multiple_of,
-    clippy::needless_range_loop,
-    clippy::manual_div_ceil,
-    clippy::manual_checked_ops,
-    dead_code
-)]
+// (The golden tests and the dumps each use only part of this module.)
+#![allow(dead_code)]
+
+use std::fmt::Write;
 
 /// The two programs make the same blocks from the same seed: a 64-bit linear congruential
 /// generator, the high half of its state.
@@ -22,8 +17,8 @@ impl Random {
     pub fn next(&mut self) -> u32 {
         self.state = self
             .state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         (self.state >> 32) as u32
     }
 }
@@ -36,21 +31,58 @@ pub struct Hash {
 impl Hash {
     pub fn new() -> Hash {
         Hash {
-            value: 14695981039346656037,
+            value: 14_695_981_039_346_656_037,
         }
     }
 
     pub fn add(&mut self, data: &[u8]) {
         for &byte in data {
             self.value ^= u64::from(byte);
-            self.value = self.value.wrapping_mul(1099511628211);
+            self.value = self.value.wrapping_mul(1_099_511_628_211);
         }
     }
+}
+
+/// The generator's own half of a float: to nearest, ties to even.
+fn to_half(f: f32) -> u16 {
+    let bits = f.to_bits();
+    let sign = (bits >> 16) & 0x8000;
+    let ui = bits & 0x7fff_ffff;
+    if ui > 0x7f80_0000 {
+        return (sign | 0x7e00 | ((ui >> 13) & 0x3ff)) as u16;
+    }
+    if ui == 0x7f80_0000 {
+        return (sign | 0x7c00) as u16;
+    }
+    let exp = (ui >> 23) as i32;
+    let mant = ui & 0x7f_ffff;
+    if exp >= 113 {
+        let mut h = (((exp - 112) as u32) << 10) | (mant >> 13);
+        let rest = mant & 0x1fff;
+        if rest > 0x1000 || (rest == 0x1000 && h & 1 != 0) {
+            h += 1;
+        }
+        return (sign | h.min(0x7c00)) as u16;
+    }
+    if exp < 102 {
+        return sign as u16;
+    }
+    let m = mant | 0x80_0000;
+    let shift = (126 - exp) as u32;
+    let mut h = m >> shift;
+    let rest = m & ((1 << shift) - 1);
+    let halfway = 1u32 << (shift - 1);
+    if rest > halfway || (rest == halfway && h & 1 != 0) {
+        h += 1;
+    }
+    (sign | h) as u16
 }
 
 /// The `dwa_write` and `dwa_read` dumps of `compare/dump_dwa.c`: synthetic blocks of an image
 /// compressed as DWAA or DWAB and back (`dwa_write`), or compressed, damaged and decompressed
 /// (`dwa_read`).
+// (One function, with the C generator's names, so that the two read alike line by line.)
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
 pub fn dwa(what: &str, seed: u64, count: u32) -> String {
     use openexr_nrp::PixelType;
     use openexr_nrp::dwa::{AcCompression, Channel, compress, decompress};
@@ -87,45 +119,10 @@ pub fn dwa(what: &str, seed: u64, count: u32) -> String {
     let (mut raw_total, mut block_total, mut stored) = (0u64, 0u64, 0u64);
     let (mut decompressed, mut refused) = (0u64, 0u64);
 
-    // The generator's own half of a float: to nearest, ties to even.
-    fn to_half(f: f32) -> u16 {
-        let bits = f.to_bits();
-        let sign = (bits >> 16) & 0x8000;
-        let ui = bits & 0x7fff_ffff;
-        if ui > 0x7f80_0000 {
-            return (sign | 0x7e00 | ((ui >> 13) & 0x3ff)) as u16;
-        }
-        if ui == 0x7f80_0000 {
-            return (sign | 0x7c00) as u16;
-        }
-        let exp = (ui >> 23) as i32;
-        let mant = ui & 0x7f_ffff;
-        if exp >= 113 {
-            let mut h = (((exp - 112) as u32) << 10) | (mant >> 13);
-            let rest = mant & 0x1fff;
-            if rest > 0x1000 || (rest == 0x1000 && h & 1 != 0) {
-                h += 1;
-            }
-            return (sign | h.min(0x7c00)) as u16;
-        }
-        if exp < 102 {
-            return sign as u16;
-        }
-        let m = mant | 0x80_0000;
-        let shift = (126 - exp) as u32;
-        let mut h = m >> shift;
-        let rest = m & ((1 << shift) - 1);
-        let halfway = 1u32 << (shift - 1);
-        if rest > halfway || (rest == halfway && h & 1 != 0) {
-            h += 1;
-        }
-        (sign | h) as u16
-    }
-
     for i in 0..count {
         // MakeBlock
-        let compression = if r.next() % 2 != 0 { 8 } else { 9 };
-        let tiled = r.next() % 4 == 0;
+        let compression = if r.next().is_multiple_of(2) { 9 } else { 8 };
+        let tiled = r.next().is_multiple_of(4);
         let width = 1 + match r.next() % 8 {
             0 => r.next() % 8,
             1..=4 => r.next() % 64,
@@ -138,7 +135,7 @@ pub fn dwa(what: &str, seed: u64, count: u32) -> String {
         let level = match r.next() % 8 {
             4 => 0.0f32,
             5 => (r.next() % 300) as f32 + (r.next() % 100) as f32 / 100.0,
-            6 => (r.next() % 100000) as f32 / 7.0,
+            6 => (r.next() % 100_000) as f32 / 7.0,
             7 => (r.next() % 2000) as f32 / 10.0,
             _ => 45.0,
         };
@@ -163,7 +160,7 @@ pub fn dwa(what: &str, seed: u64, count: u32) -> String {
             } else {
                 0
             };
-            let lin = r.next() % 8 == 0;
+            let lin = r.next().is_multiple_of(8);
             let bpe = if pixel_type == 1 { 2 } else { 4 };
             let kind = r.next() % 8;
             let (a, b, c) = (r.next() % 32, r.next() % 32, r.next() % 1000);
@@ -193,7 +190,7 @@ pub fn dwa(what: &str, seed: u64, count: u32) -> String {
                             } else if e != 0 {
                                 sign | ((e + 112) << 23) | (m << 13)
                             } else {
-                                (m as f32 / 16777216.0).to_bits() | sign
+                                (m as f32 / 16_777_216.0).to_bits() | sign
                             };
                         } else if lin && (bits & 0x7f80_0000) == 0x7f80_0000 {
                             bits = 0;
@@ -211,7 +208,7 @@ pub fn dwa(what: &str, seed: u64, count: u32) -> String {
                         1 => (r.next() % 20000) as f32 / 5000.0 - 2.0,
                         2 => a as f32 / 100.0,
                         3 => {
-                            if r.next() % 16 == 0 {
+                            if r.next().is_multiple_of(16) {
                                 (r.next() % 1000) as f32 / 50.0
                             } else {
                                 0.0
@@ -220,7 +217,7 @@ pub fn dwa(what: &str, seed: u64, count: u32) -> String {
                         6 => (((x / 8 + y / 8) as u32 + a) % 3) as f32 * 0.5,
                         _ => {
                             let f = (r.next() % 60000) as f32 + 0.5;
-                            if r.next() % 2 != 0 { f } else { -f }
+                            if r.next().is_multiple_of(2) { -f } else { f }
                         }
                     };
                     if pixel_type == 1 {
@@ -283,19 +280,13 @@ pub fn dwa(what: &str, seed: u64, count: u32) -> String {
             hash.add(&(code as u32).to_le_bytes());
             hash.add(&lines_out);
         };
-        if !read {
-            hash.add(&(raw.len() as u32).to_le_bytes());
-            hash.add(&raw);
-            hash.add(&(block.len() as u32).to_le_bytes());
-            hash.add(&block);
-            decode(&mut hash, &block);
-        } else {
+        if read {
             // Damage
             let size = block.len();
             let room = size + 400;
             block.resize(room, 0);
             let put = |data: &mut [u8], i: usize, value: u64| {
-                data[8 * i..8 * i + 8].copy_from_slice(&value.to_le_bytes())
+                data[8 * i..8 * i + 8].copy_from_slice(&value.to_le_bytes());
             };
             let get = |data: &[u8], i: usize| {
                 u64::from_le_bytes(data[8 * i..8 * i + 8].try_into().unwrap())
@@ -387,8 +378,8 @@ pub fn dwa(what: &str, seed: u64, count: u32) -> String {
                 6 => {
                     let n = (88 + r.next() % 300) as usize;
                     let n = n.min(room);
-                    for k in 0..n {
-                        block[k] = r.next() as u8;
+                    for byte in block.iter_mut().take(n) {
+                        *byte = r.next() as u8;
                     }
                     if n >= 88 {
                         for i in 0..11 {
@@ -426,9 +417,15 @@ pub fn dwa(what: &str, seed: u64, count: u32) -> String {
             };
             hash.add(&(size as u32).to_le_bytes());
             decode(&mut hash, &block[..size]);
+        } else {
+            hash.add(&(raw.len() as u32).to_le_bytes());
+            hash.add(&raw);
+            hash.add(&(block.len() as u32).to_le_bytes());
+            hash.add(&block);
+            decode(&mut hash, &block);
         }
         if (i + 1) % 200 == 0 || i + 1 == count {
-            out += &format!("{what} {} {:016x}\n", i + 1, hash.value);
+            let _ = writeln!(out, "{what} {} {:016x}", i + 1, hash.value);
         }
     }
     out + &format!(
